@@ -113,6 +113,17 @@ Run this script from the repository root."
 # Helpers
 # ------------------------------------------------------------------------------
 
+# Fail loudly if a step that was supposed to produce a file did not. A container
+# can exit 0 while writing nothing the host can see (a bind mount that did not
+# resolve, for one), and a silent miss here surfaces much later as an unhealthy
+# container with a confusing log.
+assert_nonempty() {
+    local path="$1" what="$2"
+    [ -s "$path" ] || error "${what} was not created: ${path}
+The step reported success but produced no file. Check that Docker can bind-mount
+$(pwd) and re-run."
+}
+
 # Render a template to its destination, substituting PLACEHOLDER/value pairs.
 # Uses a temp file rather than `sed -i` so BSD and GNU sed both work.
 render() {
@@ -179,8 +190,13 @@ generate_wireguard_keys() {
 
 # Self-signed cert whose CN and SAN actually match what nginx serves, so clients
 # can pin it instead of disabling verification wholesale.
+#
+# The container streams both PEMs over stdout and the host writes them. Bind
+# mounting ./certs into the container would work on Linux but silently write
+# nowhere the host can see under Docker Desktop, and it would leave root-owned
+# files behind. Streaming keeps ownership and modes in the host's hands.
 generate_self_signed_cert() {
-    local cn="$1" san
+    local cn="$1" san out priv cert
 
     if [[ "$cn" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
         san="IP:$cn"
@@ -188,22 +204,31 @@ generate_self_signed_cert() {
         san="DNS:$cn"
     fi
 
+    out=$(docker run --rm -e CN="$cn" -e SAN="$san" "$CRYPTO_IMAGE" sh -ec '
+        apk add --no-cache openssl >/dev/null 2>&1
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /tmp/privkey.pem \
+            -out    /tmp/fullchain.pem \
+            -subj   "/CN=${CN}" \
+            -addext "subjectAltName=${SAN}" 2>/dev/null
+        cat /tmp/privkey.pem /tmp/fullchain.pem
+    ') || error "Failed to generate the self-signed certificate."
+
+    # PEM carries its own delimiters, so no separator markers are needed.
+    priv=$(printf '%s\n' "$out" | sed -n '/BEGIN PRIVATE KEY/,/END PRIVATE KEY/p')
+    cert=$(printf '%s\n' "$out" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p')
+
+    [ -n "$priv" ] && [ -n "$cert" ] \
+        || error "Certificate generation returned no usable PEM data."
+
     mkdir -p "$CERTS_DIR"
-    docker run --rm \
-        -v "$(pwd)/${CERTS_DIR#./}:/certs" \
-        -e CN="$cn" -e SAN="$san" \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        "$CRYPTO_IMAGE" sh -ec '
-            apk add --no-cache openssl >/dev/null 2>&1
-            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-                -keyout /certs/privkey.pem \
-                -out    /certs/fullchain.pem \
-                -subj   "/CN=${CN}" \
-                -addext "subjectAltName=${SAN}" 2>/dev/null
-            chmod 600 /certs/privkey.pem
-            chmod 644 /certs/fullchain.pem
-            chown "${HOST_UID}:${HOST_GID}" /certs/privkey.pem /certs/fullchain.pem
-        ' || error "Failed to generate the self-signed certificate."
+    printf '%s\n' "$priv" > "$CERTS_DIR/privkey.pem"
+    printf '%s\n' "$cert" > "$CERTS_DIR/fullchain.pem"
+    chmod 600 "$CERTS_DIR/privkey.pem"
+    chmod 644 "$CERTS_DIR/fullchain.pem"
+
+    assert_nonempty "$CERTS_DIR/fullchain.pem" "TLS certificate"
+    assert_nonempty "$CERTS_DIR/privkey.pem"   "TLS private key"
 
     log_success "TLS certificate issued for ${cn} (SAN: ${san})."
 }
@@ -363,6 +388,14 @@ render "$TEMPLATE_DIR/setupclient.ps1.template" "./scripts/setupclient.ps1" \
     "PLACEHOLDER_AUTH_KEY"         "$REGISTRATION_TOKEN"
 
 chmod +x ./scripts/setupclient.sh
+
+assert_nonempty "./wireguard/wg_confs/wg0.conf"   "wg0.conf"
+assert_nonempty "./nginx/nginx.conf"              "nginx.conf"
+assert_nonempty "./scripts/setupclient.sh"        "Linux client script"
+assert_nonempty "./scripts/setupclient.ps1"       "Windows client script"
+assert_nonempty "$KEYS_DIR/server_private.key"    "Server private key"
+assert_nonempty "$KEYS_DIR/server_public.key"     "Server public key"
+
 log_success "Configuration rendered from templates."
 
 mkdir -p ./peers ./etc-pihole
