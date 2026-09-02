@@ -157,7 +157,6 @@ Write-Host "   AUTOGUARD VPN CLIENT SETUP                   " -ForegroundColor C
 Write-Host "=================================================" -ForegroundColor Cyan
 
 CheckWireGuard
-RemoveOrphanedTunnels
 
 # One stable tunnel name per server. The old script appended 2, 3, 4... on each
 # run, so every failed attempt left another dead tunnel behind.
@@ -181,6 +180,11 @@ if ($Response.status -ne "ok") {
     exit 1
 }
 Write-Host "Assigned IP: $($Response.ip)" -ForegroundColor Green
+
+# Only now, with a working replacement config in hand. Tearing the old tunnel
+# down before this point would leave the user with no VPN at all whenever
+# registration failed -- a dead token or a closed port and they are stranded.
+RemoveOrphanedTunnels
 
 $PlainPath = WriteConfigToStore -Config $Response.config -PrivateKey $Keys.Private -Name $InterfaceName
 
