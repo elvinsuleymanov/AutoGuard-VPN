@@ -137,7 +137,12 @@ services:
       private_network:
         ipv4_address: ${IP_NGINX}
     healthcheck:
-      test: ["CMD-SHELL", "curl --cacert /etc/nginx/certs/fullchain.pem https://localhost || exit 1"]
+      # Liveness only. The previous check passed --cacert, which made it depend
+      # on the cert file being readable inside the container -- so it failed
+      # even while nginx was serving 443 correctly. Verifying a self-signed
+      # cert against itself proved nothing anyway. Hitting /health exercises
+      # the real path: TLS termination plus the proxy to auth-service.
+      test: ["CMD-SHELL", "curl -sk -o /dev/null https://localhost/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
