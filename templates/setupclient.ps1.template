@@ -100,22 +100,42 @@ function WriteConfigToStore($Config, $PrivateKey, $Name) {
     $path   = Join-Path $StoreDir "$Name.conf"
     $Config = $Config -replace "<PASTE_YOUR_PRIVATE_KEY_HERE>", $PrivateKey
     [System.IO.File]::WriteAllText($path, $Config, (New-Object System.Text.UTF8Encoding $false))
+    # The manager runs as SYSTEM and has to read this to import it. The store
+    # has inheritance disabled, so grant explicitly rather than assume.
+    icacls $path /inheritance:r /grant:r "SYSTEM:(F)" /grant:r "Administrators:(F)" | Out-Null
     return $path
 }
 
 function ImportIntoManager($Name) {
-    Write-Host "Importing '$Name' into the WireGuard manager..." -ForegroundColor Cyan
-    try { Restart-Service WireGuardManager -ErrorAction Stop }
-    catch {
-        Write-Host "Could not restart WireGuardManager: $_" -ForegroundColor Red
-        exit 1
+    $dpapi = Join-Path $StoreDir "$Name.conf.dpapi"
+    $plain = Join-Path $StoreDir "$Name.conf"
+
+    # Migration from plaintext to DPAPI happens while the manager is starting,
+    # so the file has to be in place before it comes up. Stop and start
+    # explicitly rather than Restart-Service, and give it room.
+    foreach ($attempt in 1..2) {
+        Write-Host "Importing '$Name' into the WireGuard manager (attempt $attempt of 2)..." -ForegroundColor Cyan
+
+        Stop-Service WireGuardManager -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        try { Start-Service WireGuardManager -ErrorAction Stop }
+        catch {
+            Write-Host "Could not start WireGuardManager: $_" -ForegroundColor Red
+            exit 1
+        }
+
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $dpapi) { return $true }
+        }
+
+        # Neither form present means something removed the file outright.
+        if (-not (Test-Path $plain)) { return $false }
     }
 
-    for ($i = 0; $i -lt 15; $i++) {
-        Start-Sleep -Seconds 1
-        if (Test-Path (Join-Path $StoreDir "$Name.conf.dpapi")) { return $true }
-    }
-    return $false
+    # Still plaintext. The store is what the GUI enumerates, and it reads both
+    # .conf and .conf.dpapi, so the tunnel is listed either way.
+    return (Test-Path $plain)
 }
 
 function VerifyHandshake($Name) {
@@ -166,10 +186,10 @@ $PlainPath = WriteConfigToStore -Config $Response.config -PrivateKey $Keys.Priva
 
 if (-not (ImportIntoManager $InterfaceName)) {
     Write-Host ""
-    Write-Host "The manager did not import the config." -ForegroundColor Red
-    Write-Host "The file is at: $PlainPath" -ForegroundColor Yellow
-    Write-Host "Open WireGuard and use 'Import tunnel(s) from file' to add it manually." -ForegroundColor Yellow
-    Start-Process $WgGui
+    Write-Host "The config did not survive in the WireGuard store." -ForegroundColor Red
+    Write-Host "Store contents:" -ForegroundColor Yellow
+    Get-ChildItem $StoreDir -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host ("  " + $_.Name) -ForegroundColor Yellow }
     exit 1
 }
 
