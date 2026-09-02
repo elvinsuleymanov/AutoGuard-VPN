@@ -4,10 +4,18 @@ $ServerPublicIp = "PLACEHOLDER_SERVER_PUBLIC_IP"
 $InterfaceName  = "PLACEHOLDER_INTERFACE_NAME"
 $AuthKey        = "PLACEHOLDER_AUTH_KEY"
 
-$WgExe        = "C:\Program Files\WireGuard\wg.exe"
-$WgGui        = "C:\Program Files\WireGuard\wireguard.exe"
-$ConfigDir    = "C:\ProgramData\WireGuard"
-$GuiConfigDir = "C:\Program Files\WireGuard\Data\Configurations"
+$WgExe = "C:\Program Files\WireGuard\wg.exe"
+$WgGui = "C:\Program Files\WireGuard\wireguard.exe"
+
+# The manager service owns this directory, and it is the only place the GUI
+# looks when it builds its tunnel list. A config installed from anywhere else
+# still runs, but has no GUI entry -- which leaves the user with an always-on
+# VPN and no way to switch it off.
+$StoreDir = "C:\Program Files\WireGuard\Data\Configurations"
+
+# Where earlier versions of this script wrote. Tunnels installed from there are
+# the orphans described above; they get cleaned up on sight.
+$LegacyDir = "C:\ProgramData\WireGuard"
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
@@ -26,29 +34,34 @@ function CheckWireGuard {
     }
 }
 
-function FindExistingTunnel {
-    if (!(Test-Path $ConfigDir)) { return $null }
-    foreach ($file in Get-ChildItem "$ConfigDir\*.conf" -ErrorAction SilentlyContinue) {
-        $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
-        if ($content -match ("Endpoint\s*=\s*" + [regex]::Escape($ServerPublicIp) + "\s*:")) {
-            return $file.BaseName
-        }
+function ServiceNameFor($Name) { "WireGuardTunnel`$$Name" }
+
+# Tunnels installed straight from a path outside the store are invisible to the
+# GUI. Remove any this script created previously, so the user is not left with
+# untoggleable services accumulating on every run.
+function RemoveOrphanedTunnels {
+    $orphans = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -like 'WireGuardTunnel$*' -and $_.PathName -like "*ProgramData\WireGuard*" }
+
+    foreach ($svc in $orphans) {
+        $tunnel = $svc.Name -replace '^WireGuardTunnel\$', ''
+        Write-Host "Removing orphaned tunnel '$tunnel' (installed outside the GUI store)..." -ForegroundColor Yellow
+        & $WgGui /uninstalltunnelservice $tunnel 2>$null
+        Start-Sleep -Seconds 2
     }
-    return $null
+
+    if (Test-Path $LegacyDir) {
+        Get-ChildItem "$LegacyDir\*.conf" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
 }
 
-function PickUniqueName($Preferred) {
-    $name = $Preferred
-    $i = 2
-    while (
-        (Test-Path "$ConfigDir\$name.conf") -or
-        (Test-Path "$GuiConfigDir\$name.conf.dpapi") -or
-        (Get-Service -Name "WireGuardTunnel`$$name" -ErrorAction SilentlyContinue)
-    ) {
-        $name = "${Preferred}${i}"
-        $i++
+function StorePathFor($Name) {
+    foreach ($ext in @("conf.dpapi", "conf")) {
+        $p = Join-Path $StoreDir "$Name.$ext"
+        if (Test-Path $p) { return $p }
     }
-    return $name
+    return $null
 }
 
 function GenerateKeypair {
@@ -66,22 +79,43 @@ function RegisterPeer($PublicKey) {
     if ($PSVersionTable.PSVersion.Major -ge 7) { $params["SkipCertificateCheck"] = $true }
 
     try { Invoke-RestMethod @params }
-    catch { Write-Host "Registration failed: $_" -ForegroundColor Red; exit 1 }
-}
-
-function WriteConfig($Config, $PrivateKey, $Path) {
-    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
-    $Config = $Config -replace "<PASTE_YOUR_PRIVATE_KEY_HERE>", $PrivateKey
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($Path, $Config, $utf8NoBom)
-    icacls $Path /inheritance:r /grant:r "SYSTEM:(F)" /grant:r "Administrators:(F)" | Out-Null
-}
-
-function StripBomIfPresent($Path) {
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        [System.IO.File]::WriteAllBytes($Path, $bytes[3..($bytes.Length - 1)])
+    catch {
+        Write-Host "Registration failed: $_" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "If that says 'Unable to connect to the remote server', the API was" -ForegroundColor Yellow
+        Write-Host "never reached at all. Check TCP 443 is open to $ServerPublicIp in your" -ForegroundColor Yellow
+        Write-Host "cloud firewall, and that nginx_proxy is running on the server." -ForegroundColor Yellow
+        exit 1
     }
+}
+
+# Writes the config as plaintext into the store. The manager encrypts it to
+# <name>.conf.dpapi on its next start, which is also what makes it appear in
+# the GUI.
+function WriteConfigToStore($Config, $PrivateKey, $Name) {
+    if (-not (Test-Path $StoreDir)) {
+        Write-Host "WireGuard config store not found at $StoreDir" -ForegroundColor Red
+        exit 1
+    }
+    $path   = Join-Path $StoreDir "$Name.conf"
+    $Config = $Config -replace "<PASTE_YOUR_PRIVATE_KEY_HERE>", $PrivateKey
+    [System.IO.File]::WriteAllText($path, $Config, (New-Object System.Text.UTF8Encoding $false))
+    return $path
+}
+
+function ImportIntoManager($Name) {
+    Write-Host "Importing '$Name' into the WireGuard manager..." -ForegroundColor Cyan
+    try { Restart-Service WireGuardManager -ErrorAction Stop }
+    catch {
+        Write-Host "Could not restart WireGuardManager: $_" -ForegroundColor Red
+        exit 1
+    }
+
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Seconds 1
+        if (Test-Path (Join-Path $StoreDir "$Name.conf.dpapi")) { return $true }
+    }
+    return $false
 }
 
 function VerifyHandshake($Name) {
@@ -103,37 +137,19 @@ Write-Host "   AUTOGUARD VPN CLIENT SETUP                   " -ForegroundColor C
 Write-Host "=================================================" -ForegroundColor Cyan
 
 CheckWireGuard
+RemoveOrphanedTunnels
 
-$existing = FindExistingTunnel
+# One stable tunnel name per server. The old script appended 2, 3, 4... on each
+# run, so every failed attempt left another dead tunnel behind.
+$existing = StorePathFor $InterfaceName
 if ($existing) {
-    Write-Host "AutoGuard tunnel '$existing' already configured for $ServerPublicIp." -ForegroundColor Yellow
-    $confPath = "$ConfigDir\$existing.conf"
-    StripBomIfPresent $confPath
-
-    $svcName = "WireGuardTunnel`$$existing"
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        & $WgGui /installtunnelservice $confPath
-        Start-Sleep -Seconds 2
-    } elseif ($svc.Status -ne "Running") {
-        try { Start-Service -Name $svcName -ErrorAction Stop }
-        catch { Write-Host "Could not start service: $_" -ForegroundColor Yellow }
-    }
-
-    if (-not (VerifyHandshake $existing)) {
-        Write-Host "Handshake never completed for '$existing'." -ForegroundColor Red
-        Write-Host "Stopping the tunnel so it doesn't blackhole your internet." -ForegroundColor Yellow
-        Stop-Service $svcName -ErrorAction SilentlyContinue
-        Write-Host "Check server-side: docker exec wireguard wg show wg0" -ForegroundColor Yellow
-        exit 1
-    }
-
+    Write-Host "Tunnel '$InterfaceName' is already in the WireGuard GUI." -ForegroundColor Green
+    Write-Host "Open WireGuard and use Activate / Deactivate to toggle it." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "To re-register from scratch, delete it in the GUI first, then re-run." -ForegroundColor Yellow
     Start-Process $WgGui
-    Write-Host "Tunnel '$existing' is active. Toggle it from the WireGuard GUI." -ForegroundColor Green
     exit 0
 }
-
-$InterfaceName = PickUniqueName $InterfaceName
 
 Write-Host "Generating keypair..." -ForegroundColor Cyan
 $Keys = GenerateKeypair
@@ -146,29 +162,38 @@ if ($Response.status -ne "ok") {
 }
 Write-Host "Assigned IP: $($Response.ip)" -ForegroundColor Green
 
-$ConfigPath = "$ConfigDir\$InterfaceName.conf"
-WriteConfig -Config $Response.config -PrivateKey $Keys.Private -Path $ConfigPath
-Write-Host "Config written to $ConfigPath" -ForegroundColor Green
+$PlainPath = WriteConfigToStore -Config $Response.config -PrivateKey $Keys.Private -Name $InterfaceName
 
-Write-Host "Adding tunnel '$InterfaceName' to WireGuard..." -ForegroundColor Cyan
-& $WgGui /installtunnelservice $ConfigPath
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Install failed (exit $LASTEXITCODE)." -ForegroundColor Red
+if (-not (ImportIntoManager $InterfaceName)) {
+    Write-Host ""
+    Write-Host "The manager did not import the config." -ForegroundColor Red
+    Write-Host "The file is at: $PlainPath" -ForegroundColor Yellow
+    Write-Host "Open WireGuard and use 'Import tunnel(s) from file' to add it manually." -ForegroundColor Yellow
+    Start-Process $WgGui
     exit 1
 }
 
-Start-Sleep -Seconds 2
+Write-Host "Tunnel '$InterfaceName' is now listed in the WireGuard GUI." -ForegroundColor Green
+
+$StorePath = StorePathFor $InterfaceName
+& $WgGui /installtunnelservice $StorePath
+Start-Sleep -Seconds 3
 
 if (-not (VerifyHandshake $InterfaceName)) {
-    Write-Host "Tunnel installed but handshake never completed." -ForegroundColor Red
-    Write-Host "Stopping the tunnel so it doesn't blackhole your internet." -ForegroundColor Yellow
-    Stop-Service "WireGuardTunnel`$$InterfaceName" -ErrorAction SilentlyContinue
-    Write-Host "On the server run: docker exec wireguard wg show wg0" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Tunnel installed but the handshake never completed." -ForegroundColor Red
+    Write-Host "Deactivating so it does not blackhole your internet." -ForegroundColor Yellow
+    Stop-Service (ServiceNameFor $InterfaceName) -ErrorAction SilentlyContinue
+    Write-Host ""
+    Write-Host "The tunnel stays in the GUI, so you can retry with Activate." -ForegroundColor Yellow
+    Write-Host "Check UDP 51820 is open to $ServerPublicIp, then on the server run:" -ForegroundColor Yellow
+    Write-Host "  docker exec wireguard wg show wg0" -ForegroundColor Yellow
     Write-Host "Your peer pubkey: $($Keys.Public)" -ForegroundColor Yellow
-    Write-Host "If it's missing from that output, the server-side peer-watcher didn't load your peer." -ForegroundColor Yellow
+    Start-Process $WgGui
     exit 1
 }
 
 Start-Process $WgGui
-Write-Host "VPN '$InterfaceName' is configured, handshake completed, traffic flowing." -ForegroundColor Green
-Write-Host "From now on, toggle on/off from the WireGuard GUI." -ForegroundColor Green
+Write-Host ""
+Write-Host "VPN '$InterfaceName' is connected and traffic is flowing." -ForegroundColor Green
+Write-Host "Toggle it on and off with Activate / Deactivate in the WireGuard GUI." -ForegroundColor Green
