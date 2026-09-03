@@ -1,9 +1,23 @@
 events {}
 
 http {
+    # Populated by setup.sh. Without --geo-allow it contains a single
+    # "0.0.0.0/0 1;" line, so the default behaviour is to allow everything.
+    geo $allowed_source {
+        default 0;
+        include /etc/nginx/geo/allow.conf;
+    }
+
     server {
         listen 443 ssl;
         server_name public_ip;
+
+        # 444 closes the connection with no response at all, so a blocked
+        # scanner gets nothing to fingerprint. `if` is safe here: `return` is
+        # one of the few directives it handles correctly.
+        if ($allowed_source = 0) {
+            return 444;
+        }
 
         ssl_certificate /etc/nginx/certs/fullchain.pem;
         ssl_certificate_key /etc/nginx/certs/privkey.pem;
