@@ -6,10 +6,10 @@
 <p align="center">Self-hosted WireGuard VPN with automated peer registration, ad-blocking DNS, and recursive DNSSEC.</p>
 
 <p align="center">
-  <a href="https://autoguard-vpn.vercel.app">📖 Documentation</a> ·
-  <a href="https://autoguard-vpn.vercel.app/server-setup">Server Setup</a> ·
-  <a href="https://autoguard-vpn.vercel.app/client-setup">Client Setup</a> ·
-  <a href="https://autoguard-vpn.vercel.app/faq">FAQ</a>
+  <a href="https://autoguardvpn.vercel.app">📖 Documentation</a> ·
+  <a href="https://autoguardvpn.vercel.app/server-setup">Server Setup</a> ·
+  <a href="https://autoguardvpn.vercel.app/client-setup">Client Setup</a> ·
+  <a href="https://autoguardvpn.vercel.app/faq">FAQ</a>
 </p>
 
 ---

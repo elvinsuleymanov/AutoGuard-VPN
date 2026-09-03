@@ -1,6 +1,6 @@
 services:
   unbound:
-    image: mvance/unbound:latest
+    image: mvance/unbound:1.22.0
     container_name: unbound
     restart: unless-stopped
     hostname: unbound
@@ -9,8 +9,6 @@ services:
     networks:
       private_network:
         ipv4_address: ${IP_UNBOUND}
-    env_file:
-      - .env
     healthcheck:
       test: ["CMD-SHELL", "drill @127.0.0.1 -p 5053 google.com || exit 1"]
       interval: 10s
@@ -18,14 +16,17 @@ services:
       retries: 5
       start_period: 30s
   pihole:
-    image: pihole/pihole:latest
+    image: pihole/pihole:2026.07.2
     container_name: pihole
     restart: unless-stopped
     depends_on:
       unbound:
         condition: service_healthy
     ports:
-      - "65231:80/tcp"
+      # Bound to loopback deliberately. Published Docker ports bypass the host
+      # INPUT chain, so a "ufw deny 65231" would NOT protect an 0.0.0.0 bind.
+      # Reach the admin UI over the VPN at ${IP_PIHOLE}, or via an SSH tunnel.
+      - "127.0.0.1:65231:80/tcp"
     hostname: pihole
     volumes:
       - ./etc-pihole/:/etc/pihole/
@@ -36,21 +37,16 @@ services:
     networks:
       private_network:
         ipv4_address: ${IP_PIHOLE}
-    env_file:
-      - .env
     environment:
       TZ: ${DETECTED_TZ}
       FTLCONF_webserver_api_password: ${WEBPASSWORD}
       FTLCONF_dns_upstreams: "${IP_UNBOUND}#5053"
       FTLCONF_dns_listeningMode: all
     healthcheck:
-      test: [
-        "CMD-SHELL", 
-         "dig +short +timeout=2 @127.0.0.1 google.com > /dev/null || \
-        dig +short +timeout=2 @${IP_UNBOUND} -p 5053 google.com > /dev/null || \
-        dig +short +timeout=2 @8.8.8.8 google.com > /dev/null || \
-        exit 1"
-      ]
+      # Only Pi-hole's own resolver counts. A public-resolver fallback here
+      # would report "healthy" whenever the container merely has internet,
+      # masking a dead Pi-hole/Unbound chain that the rest of the stack gates on.
+      test: ["CMD-SHELL", "dig +short +timeout=2 @127.0.0.1 google.com > /dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -61,6 +57,7 @@ services:
       context: ./wireguard
       dockerfile: Dockerfile.wireguard
     container_name: wireguard
+    restart: unless-stopped
     networks:
       private_network:
         ipv4_address: ${IP_WG}
@@ -77,8 +74,6 @@ services:
     sysctls:
       net.ipv4.conf.all.src_valid_mark: 1
       net.ipv4.ip_forward: 1
-    env_file:
-      - .env
     volumes:
       - ./wireguard:/config
       - ./peers:/config/peers
@@ -107,8 +102,15 @@ services:
     networks:
       private_network:
         ipv4_address: ${IP_AUTH}
-    env_file:
-      - .env
+    # Scoped explicitly rather than via `env_file: .env`, which would hand
+    # REGISTRATION_TOKEN and WEBPASSWORD to every container in the stack.
+    environment:
+      REGISTRATION_TOKEN: ${REGISTRATION_TOKEN}
+      INTERNAL_SUBNET: ${INTERNAL_SUBNET}
+      PUBLIC_IP: ${PUBLIC_IP}
+      PORT_WG: ${PORT_WG}
+      PORT_AUTH: ${PORT_AUTH}
+      IP_PIHOLE: ${IP_PIHOLE}
     volumes:
       - ./peers:/app/peers
       - ./wireguard/keys/server_public.key:/wg-keys/server_public.key:ro
@@ -120,13 +122,14 @@ services:
       start_period: 15s
 
   nginx-proxy:
-    image: nginx:alpine 
+    image: nginx:1.27-alpine
     container_name: nginx_proxy
     restart: unless-stopped
     ports:
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/geo:/etc/nginx/geo:ro
       - ./certs:/etc/nginx/certs:ro
     depends_on:
       auth-service:
@@ -135,7 +138,12 @@ services:
       private_network:
         ipv4_address: ${IP_NGINX}
     healthcheck:
-      test: ["CMD-SHELL", "curl --cacert /etc/nginx/certs/fullchain.pem https://localhost || exit 1"]
+      # Liveness only. The previous check passed --cacert, which made it depend
+      # on the cert file being readable inside the container -- so it failed
+      # even while nginx was serving 443 correctly. Verifying a self-signed
+      # cert against itself proved nothing anyway. Hitting /health exercises
+      # the real path: TLS termination plus the proxy to auth-service.
+      test: ["CMD-SHELL", "curl -sk -o /dev/null https://localhost/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
