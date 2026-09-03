@@ -1,1 +1,12 @@
+
 .env
+certs/
+peers/
+etc-pihole/
+scripts/
+nginx/nginx.conf
+nginx/geo/
+wireguard/keys/
+wireguard/wg_confs/
+node_modules/
+

@@ -7,25 +7,33 @@ description: Common issues and known gotchas for AutoGuard VPN.
 
 ## Clients have no internet after connecting
 
-**Likely cause:** The iptables NAT masquerade rule targets `eth0` hardcoded in `wg0.conf`:
+The masquerade rule in `wg0.conf` targets `eth0`:
 
 ```
 PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 ```
 
-If the Docker bridge egress interface is not named `eth0`, masquerade silently fails.
+That rule runs **inside** the WireGuard container, and a container on a single
+user-defined bridge always sees its interface as `eth0`. So the host's interface
+name (`ens5` on AWS Nitro, `enX0` on Amazon Linux 2023, …) does not matter here.
 
-**Fix:**
+Confirm before chasing it further:
 
 ```bash
 docker exec wireguard ip link show
+docker exec wireguard iptables -t nat -L POSTROUTING -n -v
 ```
 
-Find the actual egress interface name (e.g. `ens3`), edit `./wireguard/wg_confs/wg0.conf` to replace `eth0`, then:
+If the interface genuinely is not `eth0`, edit `templates/wg0.conf.template`
+(not the rendered `wireguard/wg_confs/wg0.conf`, which is overwritten on every
+`setup.sh` run), then:
 
 ```bash
-docker compose restart wireguard
+./setup.sh && docker compose restart wireguard
 ```
+
+Otherwise check `net.ipv4.ip_forward` on the host and that your cloud firewall
+allows outbound traffic.
 
 ## Registration fails with an SSL certificate error
 
@@ -45,13 +53,41 @@ PS 5.1: `[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true
 
 ## `docker compose up` fails before running setup.sh
 
-The `.env` file is empty in the repository. Docker Compose cannot interpolate variables like `${IP_WG}` until `setup.sh` writes the file. Always run `./setup.sh` before any `docker compose` commands.
+`.env` is generated, not committed. Docker Compose cannot interpolate variables
+like `${IP_WG}` until `setup.sh` writes it. Always run `./setup.sh` first.
+
+## Is it safe to re-run `setup.sh`?
+
+Yes. Every generated file is rendered fresh from `templates/` on each run, and
+the secrets in `.env` plus the keypair in `wireguard/keys/` are reused, so
+existing clients keep working.
+
+Pass `--force` only when you intend to rotate the server keypair, registration
+token, and Pi-hole password — that invalidates every client config already
+handed out.
 
 ## Pi-hole admin page is not accessible
 
-- The port is **65231**, not 80: `http://<server-ip>:65231/admin`
+The admin UI is bound to `127.0.0.1:65231` on the host, so it is deliberately not
+reachable from the internet. Get to it either over the VPN:
+
+```
+http://172.29.144.30/admin
+```
+
+or through an SSH tunnel:
+
+```bash
+ssh -L 65231:127.0.0.1:65231 <user>@<server-ip>
+# then open http://127.0.0.1:65231/admin
+```
+
 - Retrieve the generated password: `grep WEBPASSWORD .env`
 - Check the container state: `docker compose ps pihole` and `docker compose logs pihole`
+
+> Do not "fix" this by changing the publish back to `65231:80`. Docker's published
+> ports are DNAT'd in nat/PREROUTING and skip the host `INPUT` chain, so `ufw`
+> rules will not hold it back — the bind address is the only thing protecting it.
 
 ## WireGuard container is unhealthy
 
@@ -89,22 +125,6 @@ Also verify the `peers/` directory is correctly mounted in both containers:
 ```bash
 docker inspect wireguard | grep -A5 Mounts
 docker inspect auth_service | grep -A5 Mounts
-```
-
-## Accessing the Pi-hole admin UI over VPN
-
-Once connected to the VPN:
-
-```
-http://172.29.144.30/admin
-```
-
-WireGuard's NAT masquerade routes `172.29.144.0/24` traffic through the Docker network, making the Pi-hole container reachable from VPN clients.
-
-From outside the VPN, use the host port:
-
-```
-http://<server-ip>:65231/admin
 ```
 
 ## Maximum number of clients
