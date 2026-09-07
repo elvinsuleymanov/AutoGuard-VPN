@@ -1,13 +1,14 @@
 ---
 title: Server Setup
-description: Step-by-step breakdown of what setup.sh does when you run it on your server.
+description: What setup.sh does on your server, every flag it accepts, and how to verify the deployment afterwards.
 ---
+
+import { Callout, Steps, FileTree } from 'nextra/components'
 
 # Server Setup
 
-`./setup.sh` is the only command needed to bring up the entire stack.
-
-## Run It
+`./setup.sh` brings up the entire stack. It is the only command you run on the
+server.
 
 ```bash
 git clone https://github.com/ElvinSuleymanov/AutoGuard-VPN.git
@@ -16,44 +17,76 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-## Re-running
+## Command-line flags
 
-`setup.sh` is **safe to re-run.** Every generated file is rendered fresh from
-`templates/` on each run, and the secrets already in `.env` are reused. Pass
-`--force` to deliberately rotate the server keypair, the registration token, and
-the Pi-hole password — which invalidates every client config already issued.
+| Flag | Effect |
+|---|---|
+| `--force`, `-f` | Rotate the server keypair, registration token, and Pi-hole password. **Invalidates every client config already issued.** |
+| `--public-ip <addr>` | Use this address instead of detecting and prompting. Accepts a hostname. |
+| `--geo-allow <cc,…>` | Restrict the registration API to the given ISO country codes, e.g. `--geo-allow az,tr`. Everything else gets a bare connection close. Omit to allow all sources. |
+| `--render-only` | Generate keys, certificates, `.env` and all rendered configs, then stop without starting the stack. |
+| `--help`, `-h` | Print usage and exit. |
 
-## Step-by-Step Breakdown
+## Re-running is safe
 
-### 1 — Dependency Check
+`setup.sh` is idempotent. Every generated file is rendered fresh from
+`templates/` on each run, and the secrets already in `.env` are reused — so the
+token baked into your client scripts never drifts out of sync with the one
+`auth-service` validates against.
 
-Verifies `docker` is in PATH, that `docker compose version` succeeds (falling back
-to the legacy `docker-compose` binary), and that the daemon is reachable. Exits
-with install links if any check fails.
+<Callout type="warning">
+  `--force` is the exception. It rotates the keypair, the registration token and
+  the Pi-hole password, which breaks every client config already handed out.
+  Use it when you believe a token has leaked, not as a general "clean run".
+</Callout>
 
-Docker and Compose are the only host requirements. Key generation and certificate
-issuance both run inside a disposable `alpine:3.20` container.
+Two things stop a re-run from silently doing nothing, and both are easy to get
+wrong:
 
-### 2 — OS & Timezone Detection
+- `docker compose up -d` will not recreate a container whose only change is the
+  *content* of a bind-mounted config file, so a re-run explicitly restarts
+  `wireguard` and `nginx-proxy` to pick up freshly rendered configs.
+- `up -d` also builds only when an image is **missing**, never because the source
+  changed. `setup.sh` therefore passes `--build`, so a `git pull` that touches
+  `auth/` or `wireguard/` actually ships on the next run.
+
+Between them, `git pull && ./setup.sh` is the whole update procedure. You should
+never need to run a `docker compose` command by hand.
+
+## What it does, step by step
+
+<Steps>
+
+### Dependency check
+
+Verifies `docker` is in `PATH`, that `docker compose version` succeeds (falling
+back to a legacy `docker-compose` binary), that the daemon is reachable, and
+that `templates/` exists so you are running from the repository root.
+
+Docker and Compose are the **only** host requirements. Key generation and
+certificate issuance both run inside a disposable `alpine:3.20` container.
+
+### Timezone detection
 
 ```bash
-DETECTED_TZ=$(timedatectl 2>/dev/null | grep "Time zone" | awk '{print $3}')
-if [ -z "$DETECTED_TZ" ]; then
-    DETECTED_TZ=$(cat /etc/timezone 2>/dev/null || echo "UTC")
-fi
+tz=$(timedatectl 2>/dev/null | awk '/Time zone/ {print $3}')
+[ -z "$tz" ] && tz=$(cat /etc/timezone 2>/dev/null || echo "UTC")
 ```
 
-Written to `.env` as `DETECTED_TZ` and consumed by the Pi-hole container.
+Written to `.env` as `DETECTED_TZ` and consumed by the Pi-hole container so its
+query log timestamps match the host.
 
-### 3 — Public IP Detection
+### Public IP detection
 
 ```bash
 curl -s --max-time 5 https://ifconfig.me/
 ```
 
-Prompts you to confirm or override the detected IP. Used as the WireGuard `Endpoint` in all generated client configs and as the Nginx `server_name`.
+You are prompted to confirm or override the result; `--public-ip` skips the
+prompt entirely. The value becomes the WireGuard `Endpoint` in every client
+config, the nginx `server_name`, and the certificate's CN and SAN.
 
-### 4 — Secret Generation
+### Secret generation
 
 ```bash
 random_hex() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
@@ -61,77 +94,87 @@ random_b64() { head -c 12 /dev/urandom | base64 | tr -d '\n'; }
 ```
 
 Straight from the kernel CSPRNG — no `openssl` on the host. `REGISTRATION_TOKEN`
-is the `X-Auth-Token` value clients must present to `/addnewpeer`; it is rendered
-into both client scripts at step 11.
+is the `X-Auth-Token` value clients must present to `/addnewpeer`. Existing
+values in `.env` are reused unless `--force` is passed.
 
-On a re-run without `--force`, the existing values in `.env` are reused so the
-token in `scripts/setupclient.sh` never drifts out of sync with the one
-`auth-service` is validating against.
+### WireGuard X25519 keypair
 
-### 5 — WireGuard X25519 Keypair
-
-Generated inside a disposable container:
+Generated in a throwaway container and streamed back over stdout:
 
 ```bash
 docker run --rm alpine:3.20 sh -ec '
     apk add --no-cache openssl >/dev/null 2>&1
     pem=$(mktemp)
     openssl genpkey -algorithm X25519 -out "$pem" 2>/dev/null
-    openssl pkey -in "$pem" -outform DER         | tail -c 32 | base64
-    openssl pkey -in "$pem" -pubout -outform DER | tail -c 32 | base64
+    openssl pkey -in "$pem" -outform DER          | tail -c 32 | base64
+    openssl pkey -in "$pem" -pubout -outform DER  | tail -c 32 | base64
+    rm -f "$pem"
 '
 ```
 
-Both halves are persisted — `./wireguard/keys/server_private.key` (mode 600) and
-`server_public.key` (mode 644) — and reused on subsequent runs. Persisting the
-private key is what keeps `wg0.conf` and the public key handed to clients derived
-from the same secret.
+Persisted to `wireguard/keys/server_private.key` (mode `600`) and
+`server_public.key` (mode `644`), then reused on later runs. Persisting the
+private key is what keeps `wg0.conf` and the public key handed to clients
+derived from the same secret.
 
-### 6 — Rendering wg0.conf
-
-`templates/wg0.conf.template` is rendered to `./wireguard/wg_confs/wg0.conf`
-(mode 600), substituting `your-server-address` → `10.13.26.1/24` and
-`your-private-key` → the persisted key.
-
-The template itself is never modified, so the render is repeatable. `ListenPort`
-stays `51820` — that is the port *inside* the container; the host-side port comes
-from the `${PORT_WG}:51820/udp` publish in `docker-compose.yml`.
-
-> **On the hardcoded `eth0` in PostUp/PostDown:** that rule runs *inside* the
-> WireGuard container, and a container attached to a single user-defined bridge
-> always sees its interface as `eth0`. The host's egress interface name
-> (`ens5`, `enX0`, …) is irrelevant here. Confirm with
-> `docker exec wireguard ip link show` if routing misbehaves.
-
-### 7 — Self-Signed TLS Certificate
-
-Issued in a container, with a CN and SAN that match what Nginx actually serves:
+### Self-signed TLS certificate
 
 ```bash
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-  -keyout /certs/privkey.pem -out /certs/fullchain.pem \
+  -keyout /tmp/privkey.pem -out /tmp/fullchain.pem \
   -subj "/CN=${PUBLIC_IP}" -addext "subjectAltName=IP:${PUBLIC_IP}"
 ```
 
-Valid for 365 days, and reissued automatically if the public IP changes.
+Also generated in a container, with both PEMs streamed back over stdout for the
+host to write. Bind-mounting `certs/` into the container would work on Linux but
+writes nowhere the host can see under Docker Desktop, and leaves root-owned
+files behind — streaming keeps ownership and modes in the host's hands.
 
-> The registration token is a bearer credential. Because the client scripts still
-> skip verification, anyone able to MITM that first request can capture it and
-> register peers. Pinning the certificate fingerprint in the client scripts is the
-> proper fix; a matching SAN is the prerequisite for it.
+Reissued automatically when the certificate is missing, `--force` is passed, or
+the public address changed.
 
-### 8 — Rendering nginx.conf
+<Callout type="info">
+  The registration token is a bearer credential and the client scripts still
+  skip certificate verification, so anyone able to MITM that first request can
+  capture it. A matching CN and SAN is the prerequisite for pinning the
+  certificate in the client scripts, which is the proper fix.
+</Callout>
 
-`templates/nginx.conf.template` is rendered to `./nginx/nginx.conf`, substituting
-`server_name public_ip` → your public IP.
+### Rendering the configs
 
-`proxy_pass http://auth-service:5000` is left as-is: Docker's embedded DNS
-resolves the service name on the user-defined bridge, so hardcoding the container
+Every generated file comes from `templates/` through a single `render()` helper
+that substitutes placeholder/value pairs into a temp file and moves it into
+place. The templates themselves are never modified, which is what makes repeated
+runs safe.
+
+| Template | Rendered to |
+|---|---|
+| `wg0.conf.template` | `wireguard/wg_confs/wg0.conf` (mode `600`) |
+| `nginx.conf.template` | `nginx/nginx.conf` |
+| `setupclient.sh.template` | `scripts/setupclient.sh` |
+| `setupclient.ps1.template` | `scripts/setupclient.ps1` |
+
+`proxy_pass http://auth-service:5000` is left as a service name — Docker's
+embedded DNS resolves it on the user-defined bridge, so hardcoding a container
 IP would only make the config brittle.
 
-### 9 — .env File
+<Callout type="info">
+  `ListenPort` stays `51820`: that is the port *inside* the container. The
+  host-side port comes from the `${PORT_WG}:51820/udp` publish in
+  `docker-compose.yml`.
+</Callout>
 
-All configuration is written to `.env` with mode `600`:
+### Building the geo allow-list
+
+Writes `nginx/geo/allow.conf`, which the nginx `geo` block includes. Without
+`--geo-allow` it contains a single `0.0.0.0/0 1;` line and everything is
+permitted. With it, `setup.sh` downloads the aggregated CIDR list for each
+country code and always prepends loopback, the Docker bridge and the VPN subnet
+so the stack cannot block itself.
+
+### Writing .env
+
+All configuration lands in `.env` with mode `600`:
 
 | Variable | Default |
 |---|---|
@@ -144,26 +187,32 @@ All configuration is written to `.env` with mode `600`:
 | `IP_AUTH` | `172.29.144.50` |
 | `PORT_WG` | `51820` |
 | `PORT_AUTH` | `5000` |
-| `PUBLIC_IP` | detected |
+| `PUBLIC_IP` | detected or `--public-ip` |
 | `WEBPASSWORD` | generated |
 | `REGISTRATION_TOKEN` | generated |
 | `DETECTED_TZ` | detected |
 
-> **Critical:** `.env` is not in the repository — it is generated. Running
-> `docker compose up` before `setup.sh` fails on undefined variables. Always run
-> `setup.sh` first.
+Secrets are scoped per service rather than handed to every container through
+`env_file`, so `REGISTRATION_TOKEN` is visible to `auth-service` alone.
 
-Secrets are no longer handed to every container via `env_file`. Each service now
-receives only the variables it needs, so `REGISTRATION_TOKEN` is visible to
-`auth-service` alone.
+<Callout type="error">
+  `.env` is generated, not committed. Running `docker compose up` before
+  `setup.sh` fails on undefined variables. Always run `setup.sh` first.
+</Callout>
 
-### 10 — Stack Startup
+### Starting the stack
 
 ```bash
-docker compose up -d --wait
+docker compose up -d --build --wait
 ```
 
-Startup order enforced by `depends_on` with `condition: service_healthy`:
+`--build` is what makes "just re-run `setup.sh`" true after a `git pull`. Plain
+`up -d` builds only when an image is **missing**, so a changed `auth/` or
+`wireguard/` would keep running the old image and your update would silently not
+ship. Layers are cached, so a run with nothing to rebuild costs seconds.
+
+`--wait` blocks until every service reports healthy, and `depends_on` with
+`condition: service_healthy` enforces the order:
 
 ```
 unbound (healthy)
@@ -173,48 +222,78 @@ unbound (healthy)
                     └── nginx-proxy (healthy)
 ```
 
-The script polls for up to 120 seconds. On timeout it prints: `docker compose logs`.
+If any service never becomes healthy the script exits and points you at
+`docker compose logs`.
 
-### 11 — Client Script Rendering
+</Steps>
 
-`templates/setupclient.sh.template` and `templates/setupclient.ps1.template` are
-rendered into `./scripts/`:
-
-| Placeholder (bash) | Placeholder (PS1) | Value |
-|---|---|---|
-| `PLACEHOLDER-PUBLIC-IP` | `PLACEHOLDER_SERVER_PUBLIC_IP` | `$PUBLIC_IP` |
-| `PLACEHOLDER-INTERFACE-NAME` | `PLACEHOLDER_INTERFACE_NAME` | `wg0` |
-| `PLACEHOLDER-AUTH_KEY` | `PLACEHOLDER_AUTH_KEY` | `$REGISTRATION_TOKEN` |
-
-`./scripts/setupclient.sh` and `./scripts/setupclient.ps1` are then ready to
-distribute. Both are gitignored — they contain a live token.
-
-## Post-Setup Verification
+## Verifying the deployment
 
 ```bash
-docker compose ps
-docker exec wireguard wg show wg0
+docker compose ps                                    # all five (healthy)
+docker exec wireguard wg show wg0                    # interface up, peers listed
 docker exec nginx_proxy curl -sk https://localhost/health
-grep WEBPASSWORD .env
+grep WEBPASSWORD .env                                # Pi-hole admin password
 ```
 
-Pi-hole admin is bound to `127.0.0.1:65231`. Reach it over the VPN at
-`http://172.29.144.30/admin`, or via `ssh -L 65231:127.0.0.1:65231 <user>@<server-ip>`.
+Pi-hole's admin UI is bound to `127.0.0.1:65231`. Reach it over the VPN at
+`http://172.29.144.30/admin`, or tunnel in:
 
-## Generated Files
+```bash
+ssh -L 65231:127.0.0.1:65231 <user>@<server-ip>
+```
 
-None of these are tracked in git; `setup.sh` owns all of them.
+## Generated files
 
-| Path | Contents |
-|---|---|
-| `.env` | All configuration and secrets (mode 600) |
-| `wireguard/keys/` | Server keypair |
-| `wireguard/wg_confs/wg0.conf` | Rendered interface config |
-| `nginx/nginx.conf` | Rendered proxy config |
-| `certs/` | Self-signed TLS keypair |
-| `scripts/` | Rendered client installers |
-| `peers/` | Registered peer configs |
-| `etc-pihole/` | Pi-hole state and FTL database |
+None of these are tracked in git — `setup.sh` owns all of them.
 
-`.env`, `wireguard/keys/`, `certs/`, and `peers/` are the entire state of the
-deployment — back those up. Losing them invalidates every issued client config.
+<FileTree>
+  <FileTree.File name=".env" />
+  <FileTree.Folder name="certs" defaultOpen>
+    <FileTree.File name="fullchain.pem" />
+    <FileTree.File name="privkey.pem" />
+  </FileTree.Folder>
+  <FileTree.Folder name="nginx">
+    <FileTree.File name="nginx.conf" />
+    <FileTree.Folder name="geo">
+      <FileTree.File name="allow.conf" />
+    </FileTree.Folder>
+  </FileTree.Folder>
+  <FileTree.Folder name="wireguard">
+    <FileTree.Folder name="keys" defaultOpen>
+      <FileTree.File name="server_private.key" />
+      <FileTree.File name="server_public.key" />
+    </FileTree.Folder>
+    <FileTree.Folder name="wg_confs">
+      <FileTree.File name="wg0.conf" />
+    </FileTree.Folder>
+  </FileTree.Folder>
+  <FileTree.Folder name="scripts">
+    <FileTree.File name="setupclient.sh" />
+    <FileTree.File name="setupclient.ps1" />
+  </FileTree.Folder>
+  <FileTree.Folder name="peers" />
+  <FileTree.Folder name="etc-pihole" />
+</FileTree>
+
+<Callout type="warning">
+  `.env`, `wireguard/keys/`, `certs/` and `peers/` are the entire state of the
+  deployment. Back them up. Losing them invalidates every issued client config.
+</Callout>
+
+## Starting over
+
+To wipe the deployment and rebuild from nothing. Order matters — `down` needs
+`.env` to resolve its variables, so tear the stack down *before* deleting it:
+
+```bash
+docker compose down --remove-orphans --rmi local
+sudo rm -rf .env certs peers etc-pihole scripts nginx \
+            wireguard/keys wireguard/wg_confs
+./setup.sh
+```
+
+`sudo` is needed because Pi-hole and WireGuard write into those directories as
+root. Do **not** delete `wireguard/` or `unbound/` wholesale — they hold tracked
+files. Deleting `.env` rotates every secret, so all existing clients must
+re-register.

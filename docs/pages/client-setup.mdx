@@ -1,21 +1,58 @@
 ---
 title: Client Setup
-description: How to connect a Linux or Windows client to AutoGuard VPN.
+description: Connect a Linux or Windows client to AutoGuard VPN with a single script, and manage the tunnel afterwards.
 ---
 
-import { Tabs } from 'nextra/components'
+import { Tabs, Steps, Callout } from 'nextra/components'
 
 # Client Setup
 
-After `setup.sh` runs on the server, `./scripts/setupclient.sh` and `./scripts/setupclient.ps1` are ready to distribute. The scripts are **idempotent**: if a WireGuard config already exists on the client, they bring up the existing tunnel and exit.
+After `setup.sh` runs on the server, `scripts/setupclient.sh` and
+`scripts/setupclient.ps1` are ready to distribute. Both already contain your
+server address and registration token — copy the right one to the client and run
+it with root or Administrator rights.
 
-## What Happens
+<Callout type="warning">
+  These rendered scripts hold a live bearer token and are gitignored for that
+  reason. Move them over a channel you trust. If one leaks, rotate with
+  `./setup.sh --force` — that invalidates every config already issued.
+</Callout>
 
-1. The script generates a WireGuard X25519 keypair **locally** — the private key never leaves the device.
-2. It sends only the **public key** plus `X-Auth-Token` to `https://<SERVER>/addnewpeer`.
-3. The server responds with a WireGuard config containing `<PASTE_YOUR_PRIVATE_KEY_HERE>`.
-4. The script substitutes the placeholder with the locally-generated private key.
-5. The config is written to disk and the tunnel is started.
+## The registration handshake
+
+Both scripts follow the same five steps, and the ordering is the part that
+matters for security:
+
+<Steps>
+
+### The keypair is generated locally
+
+`wg genkey` on the client. **The private key never leaves the device** and is
+never transmitted, logged, or stored on the server.
+
+### Only the public key is sent
+
+A single `POST` to `https://<server>/addnewpeer` carrying the public key and the
+`X-Auth-Token` header. An attacker who captures this request learns a public key
+and a token — never an identity they can use as this peer.
+
+### The server allocates an address
+
+`auth-service` scans existing peer files for used addresses, takes the first
+free one in `10.13.26.2`–`10.13.26.254`, and writes the peer file. `peer-watcher.sh`
+picks it up through `inotifywait` and applies it with `wg addconf` — no restart,
+no dropped peers.
+
+### The config comes back with a placeholder
+
+The returned config contains the literal `<PASTE_YOUR_PRIVATE_KEY_HERE>`, which
+the client substitutes with the key it generated in step 1.
+
+### The tunnel comes up
+
+The config is written with restrictive permissions and the interface is started.
+
+</Steps>
 
 <Tabs items={['Linux', 'Windows']}>
 <Tabs.Tab>
@@ -25,14 +62,23 @@ After `setup.sh` runs on the server, `./scripts/setupclient.sh` and `./scripts/s
 ### Prerequisites
 
 ```bash
-sudo apt install wireguard-tools curl python3
+sudo apt install wireguard-tools curl python3 iptables
 ```
 
 On RHEL/Fedora:
 
 ```bash
-sudo dnf install wireguard-tools curl python3
+sudo dnf install wireguard-tools curl python3 iptables
 ```
+
+<Callout type="info">
+  Unlike the Windows script, the Linux one does not install its own
+  dependencies — it checks for `wg`, `curl`, `python3` and `iptables`, and exits
+  with an install hint if any is missing. `iptables` is required because the
+  kill switch is built from `iptables` rules. On nftables-only systems the
+  `iptables-nft` shim satisfies this; a host with neither will fail the check
+  with a clear message rather than installing a tunnel with no leak protection.
+</Callout>
 
 ### Run
 
@@ -41,11 +87,14 @@ chmod +x setupclient.sh
 sudo ./setupclient.sh
 ```
 
-### What It Does
+### What it does
 
-1. Checks that `wg`, `curl`, and `python3` are in PATH; requires root.
-2. If `/etc/wireguard/wg0.conf` already exists → runs `wg-quick up wg0` and exits.
-3. Generates keypair: `wg genkey` → private key; `echo privkey | wg pubkey` → public key.
+1. Requires root, then checks `wg`, `curl`, `python3` and `iptables` are in
+   `PATH`, and detects whether the kernel has IPv6 (`/proc/net/if_inet6`).
+2. **If `/etc/wireguard/wg0.conf` already exists** → runs `wg-quick up wg0`,
+   enables the unit, and exits. Re-running is safe and does not register a
+   second peer.
+3. Generates the keypair: `wg genkey`, then `wg pubkey`.
 4. Registers with the server:
    ```bash
    curl -sk -X POST \
@@ -54,33 +103,90 @@ sudo ./setupclient.sh
      -d '{"public_key": "<pubkey>"}' \
      https://<SERVER_IP>/addnewpeer
    ```
-5. Parses the JSON response with `python3`. Validates `status == "ok"`.
-6. Replaces `<PASTE_YOUR_PRIVATE_KEY_HERE>` with the private key → writes `/etc/wireguard/wg0.conf` (mode 600).
-7. Runs `wg-quick up wg0` and enables `systemctl enable wg-quick@wg0`.
+5. Parses the JSON with `python3` and requires `status == "ok"`.
+6. Substitutes the private key, injects the kill switch hooks into the
+   `[Interface]` section, and writes `/etc/wireguard/wg0.conf` with mode `600`.
+7. Runs `wg-quick up wg0` and `systemctl enable wg-quick@wg0` so the tunnel
+   survives a reboot. **If bring-up fails it tears the interface back down**,
+   so a half-applied kill switch can never strand you offline.
 
-### Generated Config Structure
+### The generated config
 
 ```ini
 [Interface]
 PrivateKey = <client-private-key>
 Address = 10.13.26.X/32
 DNS = 172.29.144.30
+PostUp  = iptables  -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+PreDown = iptables  -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+PostUp  = ip6tables -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+PreDown = ip6tables -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
 
 [Peer]
 PublicKey = <server-public-key>
 Endpoint = <SERVER_IP>:51820
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 ```
 
-`AllowedIPs = 0.0.0.0/0` routes all traffic through the VPN. DNS queries go to Pi-hole at `172.29.144.30`.
+`AllowedIPs = 0.0.0.0/0, ::/0` claims both address families. `DNS` points at
+Pi-hole inside the Docker bridge, reachable only once the tunnel is up.
 
-### Manage the Tunnel
+The `PostUp`/`PreDown` hooks are added by `setupclient.sh` on the client, not
+by the server. WireGuard for Windows rejects configs containing them unless
+script execution is enabled in the registry, so shipping them from the server
+would break every Windows client.
+
+### The kill switch
+
+Those four rules are the kill switch. They reject any output that is not
+leaving through the tunnel, and they stay installed until `PreDown` removes
+them — so losing the interface abruptly fails closed, while a clean
+`wg-quick down` restores normal connectivity.
+
+Two clauses do the real work, and removing either breaks it:
+
+| Clause | Purpose |
+|---|---|
+| `! --mark $(wg show %i fwmark)` | Exempts WireGuard's own handshake packets, which carry that mark. Without it the rule blocks the tunnel it is protecting. |
+| `! --dst-type LOCAL` | Exempts loopback and link-local traffic. |
+
+Worth knowing about the two failure modes, because only one of them is the
+kill switch doing its job:
+
+| State | Result |
+|---|---|
+| Interface gone (crash, sleep/resume, pre-boot) | **Blocked.** This is the kill switch. |
+| Interface up, peer unreachable | Blackholed by routing — traffic never leaves anyway. |
+
+<Callout type="warning">
+  The kill switch blocks **LAN access too** — local printers, SSH to machines on
+  your network, router admin pages. That is what "block everything not in the
+  tunnel" means. To get back on your local network, bring the tunnel down
+  cleanly with `sudo wg-quick down wg0`.
+</Callout>
+
+### IPv6
+
+The tunnel is IPv4-only: `Address` is a `/32` and the server has no IPv6. `::/0`
+is therefore in `AllowedIPs` to **blackhole** IPv6, not to carry it — it pulls a
+default IPv6 route into an interface that cannot route it, so those packets die
+locally. Without that line, a dual-stack client sends IPv6 straight out its
+normal interface and exposes its real address while everything appears to work.
+
+If IPv6 is disabled in your kernel, `setupclient.sh` detects it (`/proc/net/if_inet6`
+is absent), strips `::/0` so `wg-quick` can start, and skips the `ip6tables`
+hooks. Nothing can leak over a stack that is not there.
+
+### Manage the tunnel
 
 ```bash
-sudo wg show wg0
-sudo wg-quick down wg0
-sudo wg-quick up wg0
+sudo wg show wg0          # peers, handshakes, transfer counters
+sudo wg-quick down wg0    # disconnect, and restore normal connectivity
+sudo wg-quick up wg0      # reconnect
+
+sudo iptables  -S OUTPUT | grep REJECT   # confirm the kill switch is installed
+sudo ip6tables -S OUTPUT | grep REJECT
 ```
 
 </Tabs.Tab>
@@ -90,8 +196,10 @@ sudo wg-quick up wg0
 
 ### Prerequisites
 
-- Windows 10/11, PowerShell 5.1+, Administrator privileges
-- WireGuard for Windows — auto-installed via `winget` if not present
+- Windows 10 or 11, PowerShell 5.1 or newer
+- An **Administrator** PowerShell session — the script declares
+  `#Requires -RunAsAdministrator` and will refuse to run otherwise
+- WireGuard for Windows — installed automatically via `winget` if absent
 
 ### Run
 
@@ -102,50 +210,143 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setupclient.ps1
 ```
 
-> `-Scope Process` limits the policy change to the current session only.
+<Callout type="info">
+  `-Scope Process` limits the policy change to this window only; nothing
+  persists after you close it.
+</Callout>
 
-### SSL Certificate Note
+### What it does
 
-The server uses a self-signed certificate. The script handles this automatically:
-- **PS 7+:** uses `-SkipCertificateCheck` on `Invoke-RestMethod`
-- **PS 5.1:** sets `[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}`
+1. **Installs WireGuard if needed** — checks for
+   `C:\Program Files\WireGuard\wg.exe`, otherwise runs
+   `winget install -e --id WireGuard.WireGuard --silent`.
+2. **Waits for the config store.** The MSI does not create
+   `C:\Program Files\WireGuard\Data\Configurations` — the `WireGuardManager`
+   service creates it on its first start, and a silent install never launches
+   the GUI to trigger that. The script starts the service and waits for the
+   directory before going any further.
+3. **Exits early if the tunnel already exists.** If `wg0.conf` or
+   `wg0.conf.dpapi` is already in the store, it opens the GUI and stops — it
+   will not register a second peer.
+4. Generates the keypair with `wg.exe genkey` and `wg.exe pubkey`.
+5. Registers via `Invoke-RestMethod`, then removes any tunnel an older version
+   of this script installed from `C:\ProgramData\WireGuard`.
+6. Writes the config into the store and grants `SYSTEM` and `Administrators`
+   access with `icacls`.
+7. **Imports it into the manager** by restarting `WireGuardManager` and waiting
+   for the plaintext `wg0.conf` to become the encrypted `wg0.conf.dpapi`. That
+   conversion is what makes the tunnel appear in the GUI.
+8. Installs the tunnel service with `wireguard.exe /installtunnelservice`.
+9. **Verifies a real handshake** for up to 15 seconds. If none arrives the
+   script deactivates the tunnel so it cannot blackhole your internet, leaves it
+   listed in the GUI to retry, and prints your peer public key for debugging.
+10. **Verifies the kill switch** by confirming both default routes point at the
+    WireGuard adapter. Reports what it finds; never fails the install.
 
-### What It Does
+<Callout type="info">
+  The config goes into the **GUI store** rather than an arbitrary path on
+  purpose. A tunnel installed from anywhere else still runs, but has no entry in
+  the WireGuard GUI — which leaves you with an always-on VPN and no way to
+  switch it off.
+</Callout>
 
-1. Checks for `C:\Program Files\WireGuard\wg.exe`; if absent, installs via:
-   ```powershell
-   winget install -e --id WireGuard.WireGuard --silent
-   ```
-2. If `C:\ProgramData\WireGuard\wg0.conf` exists → reinstalls tunnel service and exits.
-3. Generates keypair with `wg.exe genkey` and `wg.exe pubkey`.
-4. Posts to the registration endpoint via `Invoke-RestMethod`.
-5. Replaces `<PASTE_YOUR_PRIVATE_KEY_HERE>` → writes `C:\ProgramData\WireGuard\wg0.conf`.
-6. Sets NTFS ACLs to `SYSTEM:(F)` and `Administrators:(F)` via `icacls`.
-7. Installs the tunnel service with `wireguard.exe /installtunnelservice <configpath>`.
-8. Starts the service and opens the WireGuard GUI.
+### The kill switch
 
-### Manage the Tunnel
+On Windows the kill switch is **WireGuard's own**, not something this project
+installs. WireGuard for Windows blocks untunneled traffic whenever a tunnel
+claims the whole address space, which the `AllowedIPs = 0.0.0.0/0, ::/0` in your
+generated config does for both IPv4 and IPv6.
 
-Use the WireGuard GUI, or PowerShell as Administrator:
+We deliberately do not write custom Windows Firewall or WFP rules on top of it.
+WireGuard already implements this correctly, and a wrong custom rule can lock
+you out of your own network with no easy way back.
+
+What `setupclient.ps1` does instead is **verify** it took effect. After the
+handshake succeeds it checks that both default routes actually point at the
+WireGuard adapter:
 
 ```powershell
+Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Format-Table ifIndex, NextHop
+Get-NetRoute -DestinationPrefix ::/0      | Format-Table ifIndex, NextHop
+```
+
+If IPv4 is captured but IPv6 is not, the script checks whether the machine has
+IPv6 addresses at all — a missing `::/0` route is harmless on an IPv4-only
+machine and a live leak on a dual-stack one, and it tells you which case you are
+in. This reports only; it never fails the install.
+
+<Callout type="warning">
+  While the tunnel is active, traffic that cannot go through it is blocked
+  rather than falling back — **LAN access included**. Deactivate the tunnel in
+  the GUI to reach local printers, network shares, or your router's admin page.
+</Callout>
+
+### TLS validation
+
+Whether the script validates the server's certificate is decided by
+`setup.sh` at render time, from the certificate the server actually presents:
+
+| Server certificate | Client behaviour |
+|---|---|
+| CA-signed | Validates normally — no bypass of any kind is rendered into the script |
+| Self-signed | Skips validation, because there is nothing to validate against |
+
+When validation is skipped, the mechanism depends on your PowerShell version —
+`-SkipCertificateCheck` on 7+, a `ServerCertificateValidationCallback` on 5.1.
+Either way it applies only to the one-off registration request, never to the
+WireGuard tunnel, which authenticates with its own key exchange.
+
+<Callout type="warning">
+  While the server is on a self-signed certificate, anyone able to intercept
+  that first registration request can capture the token in it. Installing a
+  CA-signed certificate closes this — see
+  [Customization](/customization).
+</Callout>
+
+### Manage the tunnel
+
+Use **Activate / Deactivate** in the WireGuard GUI, or from an Administrator
+PowerShell session:
+
+```powershell
+Get-Service   "WireGuardTunnel`$wg0"
 Stop-Service  "WireGuardTunnel`$wg0"
 Start-Service "WireGuardTunnel`$wg0"
-Get-Service   "WireGuardTunnel`$wg0"
+```
+
+```powershell
+& "C:\Program Files\WireGuard\wg.exe" show wg0
 ```
 
 </Tabs.Tab>
 </Tabs>
 
-## Adding More Clients
+## Adding more clients
 
-Run the setup script on any new device. Each run generates a fresh keypair and allocates the next available IP. No server action is required. The pool supports **253 peers** (`10.13.26.2` through `10.13.26.254`).
+Run the script on each new device. Every run generates a fresh keypair and the
+server allocates the next free address — nothing needs doing on the server side.
+The pool holds **253 peers**, `10.13.26.2` through `10.13.26.254`.
 
-## Manual Peer Removal
+Re-running on a device that is *already* configured does not create a second
+peer: both scripts detect the existing config and simply bring the tunnel up.
 
-There is no automated deregistration. To remove a peer:
+## Removing a peer
+
+There is no deregistration endpoint, so removal is manual and takes two steps —
+deleting the file alone leaves the peer live in the running interface until the
+container restarts:
 
 ```bash
-rm ./peers/<sha256-prefix>.conf
-docker exec wireguard wg set wg0 peer <public-key> remove
+# on the server
+cd ~/AutoGuard-VPN
+grep -l '10\.13\.26\.X/32' peers/*.conf        # find the peer's file
+PUB=$(awk '/PublicKey/{print $3}' peers/<file>.conf)
+docker exec wireguard wg set wg0 peer "$PUB" remove
+rm peers/<file>.conf
 ```
+
+<Callout type="warning">
+  Stale peer files consume addresses from the pool even when the client is long
+  gone, because `allocate_ip()` derives the used set by scanning `AllowedIPs`
+  lines in `peers/`. Clean up peers you have retired.
+</Callout>

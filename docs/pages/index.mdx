@@ -1,23 +1,76 @@
 ---
 title: AutoGuard VPN
-description: Self-hosted WireGuard VPN with automated peer registration, ad-blocking DNS, and recursive DNSSEC.
+description: Self-hosted WireGuard VPN with automated peer registration, Pi-hole ad blocking, and recursive DNSSEC resolution — deployed with a single script.
 ---
 
+import { Cards, Steps, Callout } from 'nextra/components'
+import Hero from '../components/Hero'
+import Features from '../components/Features'
 import Mermaid from '../components/Mermaid'
 
-# AutoGuard VPN
+<Hero />
 
-AutoGuard VPN is a fully self-hosted, containerized VPN stack. It provides automated peer registration via a secure API, network-wide ad blocking through Pi-hole, and private recursive DNS resolution via Unbound — all running on a single Docker host.
+## Why run your own
 
-## Features
+A commercial VPN moves your traffic from an ISP you did not choose to a company
+you cannot audit. AutoGuard VPN removes the third party entirely: you hold the
+server keys, the DNS resolver is yours, and no query leaves your infrastructure
+to a public resolver.
 
-- **Zero-touch client onboarding** — run one script on Linux or Windows to connect
-- **Ad-blocking DNS** — Pi-hole intercepts all VPN client DNS queries
-- **Recursive DNSSEC DNS** — Unbound resolves from root servers with no third-party DNS in the chain
-- **Hot peer reload** — `inotifywait` loads new peers into WireGuard without restarting any container
-- **Timing-safe token auth** — `secrets.compare_digest` prevents timing attacks on peer registration
+<Features />
 
-## Network Topology
+## Quick start
+
+<Steps>
+
+### Bring up the server
+
+On any Docker host with a public IPv4 address:
+
+```bash
+git clone https://github.com/ElvinSuleymanov/AutoGuard-VPN.git
+cd AutoGuard-VPN
+chmod +x setup.sh
+./setup.sh
+```
+
+`setup.sh` generates the server keypair, issues a TLS certificate, renders every
+config from `templates/`, and starts the stack. Docker and Docker Compose are
+the only things the host needs — key and certificate generation happen inside a
+throwaway `alpine` container.
+
+### Open two ports
+
+`443/tcp` for the registration API and `51820/udp` for the tunnel itself. On AWS
+that is a security-group rule; elsewhere it is your cloud firewall. Pi-hole's
+admin UI deliberately needs no rule — it binds to loopback only.
+
+### Connect a client
+
+`setup.sh` writes `scripts/setupclient.sh` and `scripts/setupclient.ps1` with
+your registration token already embedded. Copy the one you need to the client
+and run it with root or Administrator rights:
+
+```bash
+sudo ./setupclient.sh          # Linux
+```
+
+```powershell
+.\setupclient.ps1              # Windows, as Administrator
+```
+
+The client generates its own keypair, registers the public half, writes the
+config, and brings the tunnel up.
+
+</Steps>
+
+<Callout type="warning">
+  The client scripts contain a live registration token. They are gitignored for
+  that reason — distribute them over a channel you trust, and rotate with
+  `./setup.sh --force` if one leaks.
+</Callout>
+
+## How traffic flows
 
 <Mermaid chart={`
 graph TD
@@ -29,27 +82,27 @@ graph TD
   classDef nginx     fill:#f97316,stroke:#fdba74,stroke-width:2px,color:#020c17,font-weight:bold
   classDef auth      fill:#a855f7,stroke:#d8b4fe,stroke-width:2px,color:#fff,font-weight:bold
 
-  subgraph INTERNET["☁️  Internet"]
-    CLIENT["💻 Client Device"]
-    INET["🌐 Public Internet"]
+  subgraph INTERNET["Internet"]
+    CLIENT["Client Device"]
+    INET["Public Internet"]
   end
 
-  subgraph DOCKER["🐳  Docker Host  ·  172.29.144.0/24"]
-    NGINX["🔒 nginx-proxy\n172.29.144.40  ·  :443/tcp"]
-    AUTH["🔑 auth-service\n172.29.144.50  ·  :5000/tcp"]
-    WG["⚡ wireguard\n172.29.144.10  ·  :51820/udp"]
-    PIHOLE["🛡️ pihole\n172.29.144.30  ·  :53 dns"]
-    UNBOUND["🔍 unbound\n172.29.144.20  ·  :5053/udp"]
+  subgraph DOCKER["Docker Host &middot; 172.29.144.0/24"]
+    NGINX["nginx-proxy<br/>172.29.144.40 &middot; 443/tcp"]
+    AUTH["auth-service<br/>172.29.144.50 &middot; 5000/tcp"]
+    WG["wireguard<br/>172.29.144.10 &middot; 51820/udp"]
+    PIHOLE["pihole<br/>172.29.144.30 &middot; DNS"]
+    UNBOUND["unbound<br/>172.29.144.20 &middot; 5053/udp"]
   end
 
-  CLIENT  -- "① HTTPS /addnewpeer"   --> NGINX
-  NGINX   -- "proxy_pass :5000"       --> AUTH
-  AUTH    -- "writes peer .conf"      --> WG
-  CLIENT  -- "② WireGuard :51820/udp" --> WG
-  WG      -- "NAT masquerade"         --> INET
-  CLIENT  -- "③ DNS via tunnel"       --> PIHOLE
-  PIHOLE  -- "allowed → :5053"        --> UNBOUND
-  UNBOUND -- "recursive + DNSSEC"     --> INET
+  CLIENT  -- "1. HTTPS /addnewpeer" --> NGINX
+  NGINX   -- "proxy_pass :5000" --> AUTH
+  AUTH    -- "writes peer .conf" --> WG
+  CLIENT  -- "2. WireGuard 51820/udp" --> WG
+  WG      -- "NAT masquerade" --> INET
+  CLIENT  -- "3. DNS via tunnel" --> PIHOLE
+  PIHOLE  -- "allowed, to :5053" --> UNBOUND
+  UNBOUND -- "recursive + DNSSEC" --> INET
 
   class CLIENT client
   class INET inet
@@ -60,25 +113,48 @@ graph TD
   class AUTH auth
 `} />
 
-## Quick Start
+Registration happens once, over HTTPS. After that the client talks only to the
+WireGuard port, and its DNS resolves through Pi-hole into Unbound.
 
-```bash
-git clone https://github.com/ElvinSuleymanov/AutoGuard-VPN.git
-cd AutoGuard-VPN
-chmod +x setup.sh
-./setup.sh
-```
+## What's in the stack
 
-After `setup.sh` completes, copy `./scripts/setupclient.sh` (Linux) or `./scripts/setupclient.ps1` (Windows) to each client and run it as root/Administrator.
-
-## Service Summary
-
-| Service | Image | IP | Exposed Port | Role |
+| Service | Image | Address | Reachable from | Role |
 |---|---|---|---|---|
-| `wireguard` | custom | `172.29.144.10` | `51820/udp` | WireGuard VPN server |
-| `unbound` | mvance/unbound | `172.29.144.20` | none | Recursive DNS |
-| `pihole` | pihole/pihole | `172.29.144.30` | `65231/tcp` | Ad-blocking DNS |
-| `nginx-proxy` | nginx:alpine | `172.29.144.40` | `443/tcp` | TLS reverse proxy |
-| `auth-service` | custom FastAPI | `172.29.144.50` | none | Peer registration API |
+| `wireguard` | built locally | `172.29.144.10` | internet, `51820/udp` | Tunnel server, hot peer reload |
+| `nginx-proxy` | `nginx:1.27-alpine` | `172.29.144.40` | internet, `443/tcp` | TLS termination for the API |
+| `auth-service` | built locally (FastAPI) | `172.29.144.50` | bridge only | Peer registration, IP allocation |
+| `pihole` | `pihole/pihole` | `172.29.144.30` | VPN + `127.0.0.1:65231` | Ad-blocking DNS, admin UI |
+| `unbound` | `mvance/unbound` | `172.29.144.20` | bridge only | Recursive DNSSEC resolver |
 
-WireGuard clients receive IPs in `10.13.26.0/24` starting at `10.13.26.2`, supporting up to 253 peers.
+Clients receive addresses from `10.13.26.0/24` starting at `10.13.26.2`, so a
+single deployment holds up to 253 peers. The server itself is `10.13.26.1`.
+
+<Callout type="info">
+  Only two ports face the internet. Pi-hole's admin UI is published to
+  `127.0.0.1:65231` on purpose — published Docker ports are DNAT'd before the
+  host `INPUT` chain, so a firewall rule would not protect an `0.0.0.0` bind.
+  The loopback address is the control. See [Requirements](/requirements).
+</Callout>
+
+## Where to next
+
+<Cards>
+  <Cards.Card title="Requirements" href="/requirements" arrow>
+    Hardware, ports, kernel, and client prerequisites.
+  </Cards.Card>
+  <Cards.Card title="Server Setup" href="/server-setup" arrow>
+    What `setup.sh` does, step by step, and every flag it takes.
+  </Cards.Card>
+  <Cards.Card title="Client Setup" href="/client-setup" arrow>
+    Connecting Linux and Windows clients, and managing tunnels.
+  </Cards.Card>
+  <Cards.Card title="Architecture" href="/architecture" arrow>
+    Peer lifecycle, IP allocation, and the DNS chain.
+  </Cards.Card>
+  <Cards.Card title="Customization" href="/customization" arrow>
+    Subnets, ports, TLS, and Pi-hole blocklists.
+  </Cards.Card>
+  <Cards.Card title="FAQ & Troubleshooting" href="/faq" arrow>
+    Known gotchas and how to diagnose them.
+  </Cards.Card>
+</Cards>

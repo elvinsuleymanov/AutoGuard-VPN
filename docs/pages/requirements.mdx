@@ -32,6 +32,13 @@ These must be reachable from the internet:
 | `51820` | UDP | WireGuard tunnel (configurable via `PORT_WG`) |
 | `443` | TCP | Nginx — peer registration HTTPS API |
 
+That is the whole internet-facing surface. Expect `443` to attract constant
+automated scanning — every public IPv4 address does — but there is nothing
+behind it except two API routes, so the scans find nothing. To narrow it
+further, `./setup.sh --geo-allow <cc>` restricts the API to specific countries
+and closes every other connection without a response. See
+[Customization](/customization).
+
 ## Loopback-Only Port
 
 | Port | Protocol | Purpose |
@@ -80,4 +87,9 @@ WireGuard requires kernel 5.6+ (built-in) or the `wireguard` DKMS module. The Co
 | Administrator | Required for tunnel service install |
 | WireGuard for Windows | Auto-installed via `winget` if absent |
 
-> The server uses a **self-signed TLS certificate**. Client scripts disable certificate validation automatically — this does not affect VPN tunnel security.
+> By default the server uses a **self-signed TLS certificate**, and the client
+> scripts skip validation for the one-off registration request because there is
+> nothing to validate against. Install a CA-signed certificate and `setup.sh`
+> renders validation back on automatically — see
+> [Customization](/customization). Either way this concerns only registration,
+> never the WireGuard tunnel, which authenticates with its own key exchange.

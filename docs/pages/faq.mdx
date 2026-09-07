@@ -1,7 +1,9 @@
 ---
 title: FAQ & Troubleshooting
-description: Common issues and known gotchas for AutoGuard VPN.
+description: Common issues, diagnostic commands, and known gotchas for AutoGuard VPN.
 ---
+
+import { Callout } from 'nextra/components'
 
 # FAQ & Troubleshooting
 
@@ -37,7 +39,16 @@ allows outbound traffic.
 
 ## Registration fails with an SSL certificate error
 
-Expected — the server uses a self-signed cert. Client scripts handle this automatically. When calling manually:
+Expected while the server is on a self-signed certificate — the client scripts
+handle it automatically, and `setup.sh` turns validation back on by itself once
+you install a CA-signed one.
+
+If you see this **after** installing a real certificate, the scripts were
+rendered before it was in place. Re-run `./setup.sh` and redistribute
+`scripts/`; the run should report `CA-signed certificate — client scripts will
+validate TLS normally.`
+
+When calling the API manually against a self-signed server:
 
 ```bash
 curl -sk -X POST \
@@ -88,6 +99,140 @@ ssh -L 65231:127.0.0.1:65231 <user>@<server-ip>
 > Do not "fix" this by changing the publish back to `65231:80`. Docker's published
 > ports are DNAT'd in nat/PREROUTING and skip the host `INPUT` chain, so `ufw`
 > rules will not hold it back — the bind address is the only thing protecting it.
+
+## I lost all internet after the VPN dropped
+
+That is the kill switch working as designed. Clients block traffic that cannot
+go through the tunnel rather than letting it fall back to your normal
+connection — which is the whole point, since a silent fallback is exactly how a
+VPN leaks your real address without you noticing.
+
+**Get back online** by bringing the tunnel down cleanly, which runs `PreDown`
+and removes the rules:
+
+```bash
+sudo wg-quick down wg0
+```
+
+On Windows, Deactivate the tunnel in the WireGuard GUI.
+
+If a clean `wg-quick down` does **not** restore connectivity, rules were left
+behind by a bring-up that died partway. Remove them by hand:
+
+```bash
+sudo iptables  -S OUTPUT | grep -- '-j REJECT'   # find them
+sudo iptables  -D OUTPUT <rule-number>
+sudo ip6tables -D OUTPUT <rule-number>
+```
+
+Note that this also blocks **LAN access** while connected — printers, network
+shares, router admin pages. That is inherent to blocking everything outside the
+tunnel, not a bug.
+
+## Can I still reach my local network while connected?
+
+No, not with the kill switch installed. It rejects all output that is not
+leaving through the tunnel, and your LAN is not.
+
+A LAN exemption is possible — an `iptables` rule accepting your local prefix
+ahead of the REJECT — but it widens the leak surface, because anything that can
+reach that prefix bypasses the VPN. Decide it deliberately rather than by
+default. The hooks live in `templates/setupclient.sh.template`; edit the
+template, not the rendered `scripts/`, which is regenerated on every
+`setup.sh` run.
+
+## My IPv6 test site still shows my real address
+
+Check the tunnel actually claimed IPv6:
+
+```bash
+sudo wg show wg0 allowed-ips      # expect 0.0.0.0/0 and ::/0
+ip -6 route show dev wg0
+```
+
+If `::/0` is missing, your config predates the IPv6 fix — configs are generated
+at registration and existing peers are never rewritten. Re-register the client
+(delete the peer server-side first, per
+[Client Setup](/client-setup)) or add `::/0` to `AllowedIPs` by hand.
+
+The tunnel is IPv4-only, so `::/0` is there to blackhole IPv6, not carry it.
+Without it a dual-stack client sends IPv6 straight out its normal interface.
+
+## My logs are full of requests for `.env`, `wp-config.php`, `phpinfo.php`
+
+That is internet background noise, not a targeted attack. Every public IPv4
+address is swept within minutes of coming up, and the request list is a generic
+WordPress/Laravel/Django wordlist aimed at nobody in particular.
+
+Check the status codes before worrying: they will all be `404`, with a 22-byte
+body — FastAPI's `{"detail":"Not Found"}`. There are only two routes behind the
+proxy and no filesystem is served, so there is nothing to find.
+
+The `127.0.0.1 … "GET /health" … curl/…` lines at a regular interval are your
+own nginx container healthchecking itself.
+
+To cut the noise down, restrict the API by country:
+
+```bash
+./setup.sh --geo-allow az
+```
+
+Blocked sources then get nginx `444` — connection closed, no response — instead
+of being proxied through to the application. The requests still appear in the
+access log, but as one-line `444`s. Note this gates only the registration API;
+the WireGuard port is unaffected, so a client abroad cannot *register* until it
+is back inside an allow-listed country.
+
+## nginx-proxy is unhealthy
+
+Get the actual error first — the exit code identifies the cause immediately:
+
+```bash
+docker inspect --format '{{range .State.Health.Log}}exit={{.ExitCode}} {{.Output}}{{end}}' nginx_proxy
+```
+
+| Exit code | Meaning |
+|---|---|
+| `22`, `60`, `77` | A stale container is still running an older healthcheck definition |
+| `52` | Empty reply — nginx returned `444`, so the geo allow-list is blocking the healthcheck itself |
+| `7` | Connection refused — nginx never started; check `docker compose logs nginx-proxy` |
+| `127` | `curl` missing from the image |
+
+<Callout type="warning">
+  A healthcheck is baked into a container at creation. `docker compose restart`
+  restarts the process inside the *existing* container and does **not** pick up
+  a changed `healthcheck:` block. Recreate it instead:
+
+```bash
+docker compose up -d --force-recreate nginx-proxy
+```
+</Callout>
+
+## The Windows client failed the first time, then worked
+
+Fixed as of the current script — if you are still seeing it, re-render and
+redistribute `scripts/setupclient.ps1`.
+
+The WireGuard MSI installs the binaries but does not create
+`C:\Program Files\WireGuard\Data\Configurations`; the `WireGuardManager` service
+creates it on its first start, and a `--silent` install never launches the GUI to
+trigger that. The first run therefore found no config store. By the second run
+the service had started on its own.
+
+The script now waits for that directory **before** contacting the server. That
+ordering matters: the old version registered the peer first, so every failed
+first run left an orphaned peer file holding an address that
+`allocate_ip()` would never hand out again.
+
+If you hit this on an older script, clean up the abandoned peer:
+
+```bash
+cd ~/AutoGuard-VPN
+grep -l '10\.13\.26\.2/32' peers/*.conf
+PUB=$(awk '/PublicKey/{print $3}' peers/<file>.conf)
+docker exec wireguard wg set wg0 peer "$PUB" remove
+rm peers/<file>.conf
+```
 
 ## WireGuard container is unhealthy
 
