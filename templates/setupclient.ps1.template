@@ -4,6 +4,13 @@ $ServerPublicIp = "PLACEHOLDER_SERVER_PUBLIC_IP"
 $InterfaceName  = "PLACEHOLDER_INTERFACE_NAME"
 $AuthKey        = "PLACEHOLDER_AUTH_KEY"
 
+# Set by setup.sh from the certificate the server actually presents. Validation
+# is skipped only when that certificate is self-signed, leaving a client nothing
+# to validate against. Hardcoding the skip meant installing a real certificate
+# changed nothing -- clients kept accepting any certificate, so $AuthKey above
+# stayed interceptable by anyone on the path.
+$VerifyTls = "PLACEHOLDER_VERIFY_TLS" -ne "no"
+
 $WgExe = "C:\Program Files\WireGuard\wg.exe"
 $WgGui = "C:\Program Files\WireGuard\wireguard.exe"
 
@@ -18,8 +25,14 @@ $StoreDir = "C:\Program Files\WireGuard\Data\Configurations"
 $LegacyDir = "C:\ProgramData\WireGuard"
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
+    # TLS 1.2 is not enabled by default on the .NET Framework that PowerShell
+    # 5.1 runs on. This is about which protocol versions are offered, not about
+    # trust, so it applies either way.
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+    if (-not $VerifyTls) {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    }
 }
 
 function CheckWireGuard {
@@ -114,7 +127,9 @@ function RegisterPeer($PublicKey) {
     $uri     = "https://$ServerPublicIp/addnewpeer"
 
     $params = @{ Uri = $uri; Method = "POST"; Headers = $headers; Body = $body }
-    if ($PSVersionTable.PSVersion.Major -ge 7) { $params["SkipCertificateCheck"] = $true }
+    if (-not $VerifyTls -and $PSVersionTable.PSVersion.Major -ge 7) {
+        $params["SkipCertificateCheck"] = $true
+    }
 
     try { Invoke-RestMethod @params }
     catch {
@@ -194,6 +209,52 @@ function VerifyHandshake($Name) {
     return $false
 }
 
+# WireGuard for Windows implements block-untunneled-traffic itself, triggered by
+# the /0 AllowedIPs the server now sends for both address families. Writing our
+# own WFP or firewall rules here would be a bad trade: WireGuard already does it
+# correctly, and a wrong custom rule can lock someone out of their own network
+# with no easy way back.
+#
+# What is worth doing is checking it actually took effect. Capturing both
+# default routes is the precondition for that blocking, and a missing ::/0 route
+# is the specific failure that silently leaks IPv6 while everything looks fine.
+# This reports; it never fails the install.
+function VerifyKillSwitch($Name) {
+    $adapter = Get-NetAdapter -Name $Name -ErrorAction SilentlyContinue
+    if (-not $adapter) {
+        Write-Host "Could not find adapter '$Name' to verify routing." -ForegroundColor Yellow
+        return
+    }
+
+    $v4 = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceIndex -eq $adapter.ifIndex })
+    $v6 = @(Get-NetRoute -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceIndex -eq $adapter.ifIndex })
+
+    if ($v4.Count -gt 0 -and $v6.Count -gt 0) {
+        Write-Host "Kill switch active: both IPv4 and IPv6 default routes are in the tunnel." -ForegroundColor Green
+        return
+    }
+
+    if ($v4.Count -eq 0) {
+        Write-Host "IPv4 traffic is NOT routed through the tunnel." -ForegroundColor Red
+        Write-Host "Check the tunnel is active and AllowedIPs contains 0.0.0.0/0." -ForegroundColor Yellow
+        return
+    }
+
+    # IPv4 captured, IPv6 not. Harmless if the machine has no IPv6 at all;
+    # a live leak if it does, so say which case this is.
+    $hasV6 = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue |
+               Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and $_.InterfaceIndex -ne $adapter.ifIndex })
+    if ($hasV6.Count -gt 0) {
+        Write-Host "IPv6 is NOT routed through the tunnel and this machine has IPv6 addresses." -ForegroundColor Red
+        Write-Host "IPv6 traffic would bypass the VPN. Confirm AllowedIPs contains ::/0," -ForegroundColor Yellow
+        Write-Host "or disable IPv6 on your network adapter." -ForegroundColor Yellow
+    } else {
+        Write-Host "IPv4 routed through the tunnel; no IPv6 on this machine to route." -ForegroundColor Green
+    }
+}
+
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host "   AUTOGUARD VPN CLIENT SETUP                   " -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
@@ -265,7 +326,12 @@ if (-not (VerifyHandshake $InterfaceName)) {
     exit 1
 }
 
+Write-Host ""
+VerifyKillSwitch $InterfaceName
+
 Start-Process $WgGui
 Write-Host ""
 Write-Host "VPN '$InterfaceName' is connected and traffic is flowing." -ForegroundColor Green
+Write-Host "While it is active, traffic that cannot go through the tunnel is blocked" -ForegroundColor Green
+Write-Host "rather than falling back to your normal connection -- LAN access included." -ForegroundColor Green
 Write-Host "Toggle it on and off with Activate / Deactivate in the WireGuard GUI." -ForegroundColor Green

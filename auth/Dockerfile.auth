@@ -2,9 +2,14 @@ FROM python:3.14-slim
 
 WORKDIR /app
 
-
-COPY . /app
+# Dependencies before source, deliberately. With `COPY . /app` first, editing a
+# single line of helpers.py invalidated the pip layer and reinstalled every
+# dependency from the network. setup.sh now builds on every run, so that cost
+# would be paid constantly. This way a code change reuses the cached install.
+COPY requirements.txt /app/
 
 RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
 
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT_AUTH}"]

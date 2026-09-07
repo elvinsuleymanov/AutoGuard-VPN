@@ -203,7 +203,8 @@ build_geo_allowlist() {
     for cc in $(printf '%s' "$GEO_ALLOW" | tr ',' ' '); do
         cc=$(printf '%s' "$cc" | tr '[:upper:]' '[:lower:]')
         tmp=$(mktemp)
-        fetch_url "https://www.ipdeny.com/ipblocks/data/aggregated/${cc}-aggregated.zone" > "$tmp" \n            || { rm -f "$tmp"; error "Could not download the CIDR list for country '${cc}'."; }
+        fetch_url "https://www.ipdeny.com/ipblocks/data/aggregated/${cc}-aggregated.zone" > "$tmp" \
+            || { rm -f "$tmp"; error "Could not download the CIDR list for country '${cc}'."; }
 
         n=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp" || true)
         if [ "${n:-0}" -eq 0 ]; then
@@ -293,6 +294,32 @@ generate_self_signed_cert() {
     assert_nonempty "$CERTS_DIR/privkey.pem"   "TLS private key"
 
     log_success "TLS certificate issued for ${cn} (SAN: ${san})."
+}
+
+# A self-signed certificate carries an identical issuer and subject. That is
+# exactly the property the client scripts need, because it decides whether they
+# can validate the server normally or have to skip validation.
+#
+# It is deliberately not keyed on whether this run issued the certificate: the
+# reuse branch below cannot tell "the self-signed one from last run" from "a
+# real one the operator dropped into certs/", and getting that wrong either
+# breaks registration or silently disables validation on a good certificate.
+detect_self_signed() {
+    local cert="$1" out
+    out=$(docker run --rm -i "$CRYPTO_IMAGE" sh -ec '
+        apk add --no-cache openssl >/dev/null 2>&1
+        cat > /tmp/cert.pem
+        subject=$(openssl x509 -noout -subject -nameopt RFC2253 -in /tmp/cert.pem 2>/dev/null | sed "s/^subject=//")
+        issuer=$(openssl  x509 -noout -issuer  -nameopt RFC2253 -in /tmp/cert.pem 2>/dev/null | sed "s/^issuer=//")
+        [ -n "$subject" ] || exit 1
+        if [ "$subject" = "$issuer" ]; then echo yes; else echo no; fi
+    ' < "$cert") || error "Could not read the TLS certificate at ${cert}.
+Is it a valid PEM certificate?"
+
+    case "$out" in
+        yes|no) printf '%s' "$out" ;;
+        *)      error "Unexpected result inspecting ${cert}: '${out}'" ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------
@@ -415,8 +442,23 @@ if [ "$FORCE" = "yes" ] \
    || [ ! -s "$CERTS_DIR/privkey.pem" ] \
    || [ "$PREV_PUBLIC_IP" != "$PUBLIC_IP" ]; then
     generate_self_signed_cert "$PUBLIC_IP"
+    CERT_SELF_SIGNED="yes"
 else
     log_info "Reusing the existing TLS certificate."
+    CERT_SELF_SIGNED=$(detect_self_signed "$CERTS_DIR/fullchain.pem")
+fi
+
+# Client scripts skip TLS validation only when the server has nothing a client
+# could validate against. Hardcoding the skip meant that installing a real
+# certificate changed nothing: clients went on accepting any certificate at
+# all, which looks secure and is not.
+if [ "$CERT_SELF_SIGNED" = "yes" ]; then
+    VERIFY_TLS="no"
+    log_warn "Self-signed certificate — client scripts will skip TLS validation."
+    log_info "Install a CA-signed certificate in ${CERTS_DIR}/ and re-run to enable it."
+else
+    VERIFY_TLS="yes"
+    log_success "CA-signed certificate — client scripts will validate TLS normally."
 fi
 
 # ------------------------------------------------------------------------------
@@ -442,11 +484,13 @@ render "$TEMPLATE_DIR/nginx.conf.template" "./nginx/nginx.conf" \
 render "$TEMPLATE_DIR/setupclient.sh.template" "./scripts/setupclient.sh" \
     "PLACEHOLDER-PUBLIC-IP"     "$PUBLIC_IP" \
     "PLACEHOLDER-INTERFACE-NAME" "$INTERFACE_NAME" \
+    "PLACEHOLDER-VERIFY-TLS"    "$VERIFY_TLS" \
     "PLACEHOLDER-AUTH_KEY"      "$REGISTRATION_TOKEN"
 
 render "$TEMPLATE_DIR/setupclient.ps1.template" "./scripts/setupclient.ps1" \
     "PLACEHOLDER_SERVER_PUBLIC_IP" "$PUBLIC_IP" \
     "PLACEHOLDER_INTERFACE_NAME"   "$INTERFACE_NAME" \
+    "PLACEHOLDER_VERIFY_TLS"       "$VERIFY_TLS" \
     "PLACEHOLDER_AUTH_KEY"         "$REGISTRATION_TOKEN"
 
 chmod +x ./scripts/setupclient.sh
@@ -501,7 +545,12 @@ fi
 echo
 echo "🚀 Starting the stack..."
 
-if ! $DC up -d --wait; then
+# --build is not optional here. `up -d` alone builds only when an image is
+# missing, so after a `git pull` that changed auth/ or wireguard/ it silently
+# keeps running the old image and the new code never ships. That turns "re-run
+# setup.sh" into a lie and sends people hunting for a bug that is already fixed
+# on disk. Layers are cached, so a run with nothing to rebuild costs seconds.
+if ! $DC up -d --build --wait; then
     echo -e "\n${RED}${BOLD}❌ docker compose failed. Inspect the logs with: ${DC} logs${NC}"
     exit 1
 fi
