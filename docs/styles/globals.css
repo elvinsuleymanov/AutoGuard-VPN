@@ -1,0 +1,325 @@
+/*
+ * AutoGuard VPN documentation theme.
+ *
+ * Nextra ships its own Tailwind build, so everything here is either a design
+ * token the theme already reads (--nextra-primary-hue and friends) or a
+ * namespaced `ag-` class. Nothing overrides theme internals by class name --
+ * those are generated and change between minor versions.
+ */
+
+:root {
+  /* The accent is the same sky/cyan the architecture diagrams use, so the
+     prose, the buttons and the Mermaid renders all read as one palette. */
+  --ag-accent: #0ea5e9;
+  --ag-accent-bright: #38bdf8;
+  --ag-accent-soft: #7dd3fc;
+
+  --ag-ink: #0b1220;
+  --ag-ink-soft: #475569;
+  --ag-surface: #ffffff;
+  --ag-surface-raised: #f8fafc;
+  --ag-border: #e2e8f0;
+
+  --ag-hero-glow: rgba(14, 165, 233, 0.16);
+  --ag-grid-line: rgba(15, 23, 42, 0.05);
+}
+
+/*
+ * Dark surfaces are neutral, sitting a few points above Nextra's rgb(17,17,17)
+ * page background rather than the blue-black the diagrams use internally. A
+ * strongly tinted surface next to Nextra's neutral chrome is what made the
+ * first pass look like two stitched-together sites.
+ */
+.dark {
+  --ag-ink: #e8eaed;
+  --ag-ink-soft: #9aa4b2;
+  --ag-surface: #141619;
+  --ag-surface-raised: #17191d;
+  --ag-border: #2c3138;
+
+  --ag-hero-glow: rgba(14, 165, 233, 0.14);
+  --ag-grid-line: rgba(125, 211, 252, 0.06);
+}
+
+/* ---------------------------------------------------------------------------
+   Hero
+   ------------------------------------------------------------------------- */
+
+/*
+ * The hero deliberately does NOT paint a background of its own. Nextra's page
+ * background is rgb(var(--nextra-bg)) and any other colour here draws a hard
+ * vertical seam against the sidebar, which reads as two different sites glued
+ * together. Everything decorative is an overlay that fades to transparent, so
+ * the section has no edges at all.
+ */
+.ag-hero {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  margin: -1.5rem -1.5rem 3.5rem;
+  padding: 4rem 1.5rem 3.5rem;
+  background: transparent;
+  text-align: center;
+
+  /* A rule that fades out at both ends rather than stopping dead. */
+  border-bottom: 1px solid transparent;
+  border-image: linear-gradient(90deg, transparent, var(--ag-border) 25%, var(--ag-border) 75%, transparent) 1;
+}
+
+/* Grid + glow are two stacked pseudo-elements rather than one busy background
+   image, so the glow can sit above the grid and mask it toward the centre. */
+.ag-hero::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  background-image:
+    linear-gradient(var(--ag-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ag-grid-line) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%);
+}
+
+.ag-hero::after {
+  content: '';
+  position: absolute;
+  inset: -40% 0 auto;
+  height: 420px;
+  z-index: -1;
+  background: radial-gradient(ellipse 50% 50% at 50% 50%, var(--ag-hero-glow), transparent 70%);
+  pointer-events: none;
+}
+
+.ag-hero-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+  padding: 0.3rem 0.85rem;
+  border: 1px solid var(--ag-border);
+  border-radius: 999px;
+  background: var(--ag-surface-raised);
+  color: var(--ag-ink-soft);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.ag-hero-eyebrow-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+}
+
+.ag-hero h1 {
+  margin: 0;
+  font-size: clamp(2.5rem, 6vw, 4rem);
+  font-weight: 800;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+  background: linear-gradient(135deg, var(--ag-ink) 20%, var(--ag-accent) 120%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.ag-hero-tagline {
+  max-width: 44rem;
+  margin: 1.25rem auto 0;
+  color: var(--ag-ink-soft);
+  font-size: clamp(1rem, 2vw, 1.15rem);
+  line-height: 1.6;
+}
+
+.ag-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: center;
+  margin-top: 2rem;
+}
+
+.ag-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.7rem 1.4rem;
+  border-radius: 8px;
+  font-size: 0.925rem;
+  font-weight: 600;
+  text-decoration: none !important;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.ag-btn:hover {
+  transform: translateY(-1px);
+}
+
+.ag-btn-primary {
+  background: linear-gradient(135deg, var(--ag-accent) 0%, #0284c7 100%);
+  color: #f0f9ff;
+  box-shadow: 0 4px 14px rgba(14, 165, 233, 0.3);
+}
+
+.ag-btn-primary:hover {
+  box-shadow: 0 6px 20px rgba(14, 165, 233, 0.42);
+}
+
+.ag-btn-secondary {
+  border: 1px solid var(--ag-border);
+  background: var(--ag-surface-raised);
+  color: var(--ag-ink);
+}
+
+.ag-btn-secondary:hover {
+  border-color: var(--ag-accent);
+  color: var(--ag-accent);
+}
+
+/* The one-command install line under the buttons. */
+.ag-hero-command {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 2.25rem;
+  padding: 0.65rem 1.1rem;
+  border: 1px solid var(--ag-border);
+  border-radius: 8px;
+  background: var(--ag-surface);
+  color: var(--ag-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.ag-hero-command span {
+  color: var(--ag-accent-bright);
+  user-select: none;
+}
+
+.ag-hero-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: center;
+  margin-top: 2.25rem;
+}
+
+.ag-badge {
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--ag-border);
+  border-radius: 6px;
+  background: var(--ag-surface-raised);
+  color: var(--ag-ink-soft);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+/* ---------------------------------------------------------------------------
+   Feature grid
+   ------------------------------------------------------------------------- */
+
+.ag-features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1rem;
+  margin: 2rem 0;
+}
+
+.ag-feature {
+  padding: 1.4rem;
+  border: 1px solid var(--ag-border);
+  border-radius: 12px;
+  background: var(--ag-surface-raised);
+  transition: border-color 0.18s ease, transform 0.18s ease;
+}
+
+.ag-feature:hover {
+  border-color: var(--ag-accent);
+  transform: translateY(-2px);
+}
+
+.ag-feature-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  margin-bottom: 0.9rem;
+  border-radius: 9px;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.16), rgba(14, 165, 233, 0.04));
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+.ag-feature h3 {
+  margin: 0 0 0.4rem;
+  color: var(--ag-ink);
+  font-size: 0.98rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.ag-feature p {
+  margin: 0;
+  color: var(--ag-ink-soft);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.ag-feature code {
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: rgba(14, 165, 233, 0.1);
+  color: var(--ag-accent-bright);
+  font-size: 0.9em;
+}
+
+/* ---------------------------------------------------------------------------
+   Prose polish
+   ------------------------------------------------------------------------- */
+
+/* Nextra's default table is full-width only when it needs to be; forcing it
+   keeps the many reference tables in these docs from ragged-edging. */
+.nextra-content table {
+  display: table;
+  width: 100%;
+}
+
+.nextra-content table th {
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+/* Long CIDR / path cells should wrap rather than force a horizontal scrollbar
+   on the whole article. */
+.nextra-content table td {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .ag-hero {
+    margin-inline: -1rem;
+    padding: 3.25rem 1rem 3rem;
+  }
+
+  .ag-hero-command {
+    font-size: 0.75rem;
+  }
+}
+
+/* Respect users who have asked the OS for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  .ag-btn,
+  .ag-feature {
+    transition: none;
+  }
+
+  .ag-btn:hover,
+  .ag-feature:hover {
+    transform: none;
+  }
+}

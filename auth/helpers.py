@@ -77,6 +77,14 @@ def _server_public_key() -> str:
 
 def generate_client_config(client_ip: str) -> str:
     pubkey = _server_public_key()
+    # ::/0 is here to *blackhole* IPv6, not to carry it. The tunnel is IPv4-only
+    # -- Address is a /32 and the server has no IPv6 -- so without this line a
+    # dual-stack client (most home ISPs, essentially every mobile carrier) sends
+    # IPv6 straight out its normal interface and exposes its real address while
+    # everything looks like it is working. Claiming the whole v6 range pulls a
+    # default route into an interface that cannot route it, so those packets die
+    # locally instead. Anything that does reach the server is dropped there: each
+    # peer's server-side AllowedIPs stays a single IPv4 /32.
     return (
         "[Interface]\n"
         "PrivateKey = <PASTE_YOUR_PRIVATE_KEY_HERE>\n"
@@ -85,6 +93,6 @@ def generate_client_config(client_ip: str) -> str:
         "[Peer]\n"
         f"PublicKey = {pubkey}\n"
         f"Endpoint = {PUBLIC_IP}:{PORT_WG}\n"
-        "AllowedIPs = 0.0.0.0/0\n"
+        "AllowedIPs = 0.0.0.0/0, ::/0\n"
         "PersistentKeepalive = 25\n"
     )

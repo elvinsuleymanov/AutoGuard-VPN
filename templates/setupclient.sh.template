@@ -3,6 +3,7 @@
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
@@ -14,14 +15,47 @@ SERVER_IP="PLACEHOLDER-PUBLIC-IP"
 INTERFACE_NAME="PLACEHOLDER-INTERFACE-NAME"
 AUTH_KEY="PLACEHOLDER-AUTH_KEY"
 
+# Set by setup.sh from the certificate the server actually presents: "no" only
+# when it is self-signed, so there is nothing a client could validate against.
+# With a CA-signed certificate this is "yes" and curl validates normally --
+# without it, installing a real certificate would change nothing and the token
+# below would stay interceptable by anyone on the path.
+VERIFY_TLS="PLACEHOLDER-VERIFY-TLS"
+
+# An array rather than a string, so the empty case expands to no argument at
+# all instead of an empty one.
+CURL_TLS_OPTS=()
+[ "$VERIFY_TLS" = "no" ] && CURL_TLS_OPTS+=(-k)
+
 error()       { echo -e "\n${RED}❌ ERROR: $1${NC}\n" >&2; exit 1; }
 log_success() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
+log_warn()    { echo -e "${YELLOW}⚠️  $1${NC}"; }
 
 [ "$(id -u)" -eq 0 ] || error "Run this script with sudo."
 
-command -v wg      >/dev/null 2>&1 || error "wireguard-tools not installed. Run: apt install wireguard-tools"
-command -v curl    >/dev/null 2>&1 || error "curl not installed."
-command -v python3 >/dev/null 2>&1 || error "python3 not installed."
+command -v wg       >/dev/null 2>&1 || error "wireguard-tools not installed. Run: apt install wireguard-tools"
+command -v curl     >/dev/null 2>&1 || error "curl not installed."
+command -v python3  >/dev/null 2>&1 || error "python3 not installed."
+command -v iptables >/dev/null 2>&1 || error "iptables not installed. Run: apt install iptables
+It is needed for the kill switch that blocks traffic whenever the tunnel is down."
+
+# /proc/net/if_inet6 exists only when the kernel has IPv6. With v6 disabled,
+# wg-quick dies trying to add the ::/0 route the server now hands out -- and
+# nothing can leak over a stack that is not there, so drop the v6 half instead
+# of failing the install.
+HAVE_IPV6="no"
+[ -e /proc/net/if_inet6 ] && HAVE_IPV6="yes"
+
+# The ::/0 route already blackholes IPv6 on its own; the ip6tables rule is the
+# belt to its braces. Missing ip6tables is therefore a warning, not an error.
+KILL_SWITCH_V6="no"
+if [ "$HAVE_IPV6" = "yes" ]; then
+    if command -v ip6tables >/dev/null 2>&1; then
+        KILL_SWITCH_V6="yes"
+    else
+        log_warn "ip6tables not found — IPv6 is blackholed by routing, but without a kill switch rule."
+    fi
+fi
 
 WG_CONF="/etc/wireguard/${INTERFACE_NAME}.conf"
 
@@ -39,7 +73,7 @@ CLIENT_PUBLIC_KEY=$(echo "$CLIENT_PRIVATE_KEY" | wg pubkey)
 log_success "Keypair generated."
 
 echo "📡 Registering with VPN server at ${SERVER_IP}..."
-RESPONSE=$(curl -sk \
+RESPONSE=$(curl -s "${CURL_TLS_OPTS[@]}" \
     -X POST \
     -H "Content-Type: application/json" \
     -H "X-Auth-Token: ${AUTH_KEY}" \
@@ -52,13 +86,71 @@ STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin);
 WG_CONFIG=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['config'])" 2>/dev/null)
 WG_CONFIG="${WG_CONFIG//<PASTE_YOUR_PRIVATE_KEY_HERE>/${CLIENT_PRIVATE_KEY}}"
 
+# ---------------------------------------------------------------------------
+# Kill switch
+#
+# wg-quick's own default routing is not one: it sends traffic through the
+# tunnel while the interface exists, but the moment the interface goes away --
+# a crash, sleep/resume, or the gap before wg-quick@ starts at boot -- the
+# routes go with it and traffic silently falls back to the normal gateway.
+# These OUTPUT rules stay installed until PreDown removes them, so an abrupt
+# loss of the interface fails closed while a clean `wg-quick down` does not.
+#
+# Both clauses are load-bearing. Handshake packets to the endpoint carry wg's
+# own fwmark and are exempt, and --dst-type LOCAL exempts loopback and
+# link-local; drop either and the rule blocks the very tunnel it protects.
+#
+# The hooks are added here rather than server-side in generate_client_config()
+# because WireGuard for Windows refuses configs containing PostUp/PreDown
+# unless script execution is enabled in the registry -- shipping them from the
+# server would break every Windows client.
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2016  # $(wg show ...) must reach the file literally; wg-quick expands it, not us.
+HOOKS='PostUp = iptables -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+PreDown = iptables -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT'
+
+if [ "$KILL_SWITCH_V6" = "yes" ]; then
+    # shellcheck disable=SC2016  # same as above.
+    HOOKS="${HOOKS}
+PostUp = ip6tables -I OUTPUT ! -o %i -m mark ! --mark \$(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT
+PreDown = ip6tables -D OUTPUT ! -o %i -m mark ! --mark \$(wg show %i fwmark) -m addrtype ! --dst-type LOCAL -j REJECT"
+fi
+
+if [ "$HAVE_IPV6" = "no" ]; then
+    WG_CONFIG=$(printf '%s\n' "$WG_CONFIG" | sed 's|, ::/0||')
+    log_warn "IPv6 is disabled on this host — dropped ::/0 so wg-quick can start."
+fi
+
+# Inserted directly after the [Interface] header: order within a section does
+# not matter to wg-quick, and anchoring to the header avoids any assumption
+# about which key happens to come last. Appending to the file instead would
+# land these in [Peer], where they are not valid.
+WG_CONFIG=$(printf '%s\n' "$WG_CONFIG" | awk -v hooks="$HOOKS" '
+    { print }
+    /^\[Interface\]/ && !inserted { print hooks; inserted = 1 }
+')
+
 mkdir -p /etc/wireguard
 printf '%s\n' "$WG_CONFIG" > "$WG_CONF"
 chmod 600 "$WG_CONF"
 log_success "Config written to ${WG_CONF}."
 
 echo "🚀 Starting WireGuard..."
-wg-quick up "$INTERFACE_NAME" || error "wg-quick up failed."
+
+# A bring-up that fails partway can leave the REJECT rules installed, which
+# would take the user's internet down with it. Tear the interface back down
+# before reporting, so a failed install is never worse than no install.
+if ! wg-quick up "$INTERFACE_NAME"; then
+    wg-quick down "$INTERFACE_NAME" >/dev/null 2>&1 || true
+    error "wg-quick up failed. The tunnel was torn back down, so your connection is unaffected."
+fi
+
 systemctl enable "wg-quick@${INTERFACE_NAME}" 2>/dev/null || true
 
 log_success "Connected! VPN is active on interface ${INTERFACE_NAME}."
+echo
+echo -e "${BOLD}Kill switch is active.${NC} If the tunnel drops, traffic is blocked"
+echo "rather than falling back to your normal connection — including LAN access."
+echo "To go back online without the VPN, bring it down cleanly:"
+echo -e "  ${CYAN}sudo wg-quick down ${INTERFACE_NAME}${NC}"
