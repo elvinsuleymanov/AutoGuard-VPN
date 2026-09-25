@@ -81,8 +81,6 @@ services:
         - SERVERURL=${PUBLIC_IP}
         - SERVERPORT=${PORT_WG}
         - INTERNAL_SUBNET=${INTERNAL_SUBNET}
-        - DNSSEC=true
-        - PIHOLE_DNS_=${IP_PIHOLE}; 1.1.1.1, 8.8.8.8
     healthcheck:
       test: ["CMD", "wg", "show", "wg0"]
       interval: 10s

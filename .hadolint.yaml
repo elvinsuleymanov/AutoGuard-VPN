@@ -1,4 +1,2 @@
-# .hadolint.yaml
 ignored:
-  - DL3007
   - DL3018

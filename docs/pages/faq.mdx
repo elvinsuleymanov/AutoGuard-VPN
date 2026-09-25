@@ -280,7 +280,3 @@ The `10.13.26.0/24` subnet supports **253 peers** (`10.13.26.2` through `10.13.2
 rm ./peers/<sha256-prefix>.conf
 docker exec wireguard wg set wg0 peer <public-key> remove
 ```
-
-## Does `DNSSEC=true` in the WireGuard service do anything?
-
-No observable effect in this stack. That environment variable is a `linuxserver/wireguard` image convention. DNSSEC is actually enforced by Unbound in `unbound.conf`. The variable is harmless but does not change WireGuard's behavior.

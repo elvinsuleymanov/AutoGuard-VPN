@@ -1,6 +1,6 @@
 from typing import Any
 from fastapi import FastAPI, Security, HTTPException
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from helpers import (
     verify,
     is_valid_wg_pubkey,
@@ -15,7 +15,8 @@ app = FastAPI()
 class PeerRequest(BaseModel):
     public_key: str
 
-    @validator("public_key")
+    @field_validator("public_key")
+    @classmethod
     def validate_public_key(cls, v: str) -> str:
         if not is_valid_wg_pubkey(v):
             raise ValueError("Invalid WireGuard public key")

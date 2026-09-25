@@ -1,4 +1,4 @@
-FROM linuxserver/wireguard:latest
+FROM linuxserver/wireguard:1.0.20260223
 
 RUN apk add --no-cache inotify-tools
 
