@@ -115,8 +115,8 @@ go through the tunnel rather than letting it fall back to your normal
 connection — which is the whole point, since a silent fallback is exactly how a
 VPN leaks your real address without you noticing.
 
-**Get back online** by bringing the tunnel down cleanly, which runs `PreDown`
-and removes the rules:
+**Get back online** by turning the VPN off, which runs `PreDown` and removes
+the rules:
 
 ```bash
 sudo wg-quick down wg0
@@ -124,13 +124,16 @@ sudo wg-quick down wg0
 
 On Windows, Deactivate the tunnel in the WireGuard GUI.
 
-If a clean `wg-quick down` does **not** restore connectivity, rules were left
-behind by a bring-up that died partway. Remove them by hand:
+If `wg-quick down` does **not** restore connectivity — or fails with "not a
+WireGuard interface" — rules were left behind without a tunnel, for example by
+a bring-up that failed partway. The simplest fix is to **restart**: the rules
+are not saved, and the VPN stays off after a restart. Or remove them by hand:
 
 ```bash
-sudo iptables  -S OUTPUT | grep -- '-j REJECT'   # find them
-sudo iptables  -D OUTPUT <rule-number>
-sudo ip6tables -D OUTPUT <rule-number>
+sudo iptables  -L OUTPUT -n --line-numbers | grep REJECT   # note each rule's number
+sudo iptables  -D OUTPUT <number>
+sudo ip6tables -L OUTPUT -n --line-numbers | grep REJECT
+sudo ip6tables -D OUTPUT <number>
 ```
 
 Note that this also blocks **LAN access** while connected — printers, network

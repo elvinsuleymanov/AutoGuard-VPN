@@ -50,6 +50,10 @@ sudo ./setupclient.sh          # Linux
 It generates its own keypair, registers itself, and connects. No config files to
 copy around, nothing to edit on the server.
 
+Afterwards you turn the VPN on and off yourself: `sudo wg-quick up wg0` /
+`sudo wg-quick down wg0` on Linux, where it does not start by itself after a
+restart, and Activate / Deactivate in the WireGuard app on Windows.
+
 > Updating later is the same one command: `git pull && ./setup.sh`
 
 <p align="center">

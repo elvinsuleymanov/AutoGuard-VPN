@@ -38,13 +38,34 @@ error()       { echo -e "\n${RED}❌ ERROR: $1${NC}\n" >&2; exit 1; }
 log_success() { echo -e "${GREEN}${BOLD}✅ $1${NC}"; }
 log_warn()    { echo -e "${YELLOW}⚠️  $1${NC}"; }
 
+# The VPN runs only while turned on: nothing starts it at boot. So there is
+# never a moment where it looks on but is not yet protecting anything -- after
+# a reboot it is plainly off until the user turns it on.
+print_usage() {
+    echo
+    echo -e "${BOLD}The VPN stays on until you turn it off or restart. It does not start by itself.${NC}"
+    echo -e "  Turn on:  ${CYAN}sudo wg-quick up ${INTERFACE_NAME}${NC}"
+    echo -e "  Turn off: ${CYAN}sudo wg-quick down ${INTERFACE_NAME}${NC}"
+    echo
+    echo "While it is on, the kill switch blocks traffic that cannot go through the"
+    echo "tunnel instead of letting it fall back to your normal connection -- LAN"
+    echo "access included."
+}
+
+# Neither bring-up path can guarantee no kill switch rule was left behind: if
+# wg-quick fails between installing the IPv4 and IPv6 rules, it removes the
+# interface without running PreDown. The rules are not saved, so a restart
+# always clears them.
+UP_FAILED_HINT="If you have no internet now, a kill switch rule was left behind. Restart to
+clear it, or see \"I lost all internet after the VPN dropped\" in the FAQ."
+
 [ "$(id -u)" -eq 0 ] || error "Run this script with sudo."
 
 command -v wg       >/dev/null 2>&1 || error "wireguard-tools not installed. Run: apt install wireguard-tools"
 command -v curl     >/dev/null 2>&1 || error "curl not installed."
 command -v python3  >/dev/null 2>&1 || error "python3 not installed."
 command -v iptables >/dev/null 2>&1 || error "iptables not installed. Run: apt install iptables
-It is needed for the kill switch that blocks traffic whenever the tunnel is down."
+It is needed for the kill switch, which blocks traffic outside the tunnel while the VPN is on."
 
 # /proc/net/if_inet6 exists only when the kernel has IPv6. With v6 disabled,
 # wg-quick dies trying to add the ::/0 route -- and nothing can leak over a
@@ -66,11 +87,26 @@ fi
 
 WG_CONF="/etc/wireguard/${INTERFACE_NAME}.conf"
 
+# Earlier versions of this script enabled wg-quick@ so the tunnel came back at
+# boot, which left a window after every boot where the machine was online but
+# not yet protected. Undo that wherever it is still set.
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl is-enabled --quiet "wg-quick@${INTERFACE_NAME}" 2>/dev/null; then
+    systemctl disable --quiet "wg-quick@${INTERFACE_NAME}" 2>/dev/null || true
+    log_warn "Turned off starting the VPN at boot, which an earlier version of this script set up."
+fi
+
 if [ -f "$WG_CONF" ]; then
-    echo "Config already exists. Bringing up existing tunnel..."
-    wg-quick up "$INTERFACE_NAME" 2>/dev/null || true
-    systemctl enable "wg-quick@${INTERFACE_NAME}" 2>/dev/null || true
-    log_success "VPN is active on interface ${INTERFACE_NAME}."
+    if wg show "$INTERFACE_NAME" >/dev/null 2>&1; then
+        log_success "The VPN is already on (interface ${INTERFACE_NAME})."
+    else
+        echo "Config already exists. Turning the VPN on..."
+        wg-quick up "$INTERFACE_NAME" \
+            || error "wg-quick up failed for the existing config at ${WG_CONF}.
+${UP_FAILED_HINT}"
+        log_success "The VPN is on (interface ${INTERFACE_NAME})."
+    fi
+    print_usage
     exit 0
 fi
 
@@ -152,15 +188,20 @@ PersistentKeepalive = 25"
 # Kill switch
 #
 # wg-quick's own default routing is not one: it sends traffic through the
-# tunnel while the interface exists, but the moment the interface goes away --
-# a crash, sleep/resume, or the gap before wg-quick@ starts at boot -- the
-# routes go with it and traffic silently falls back to the normal gateway.
-# These OUTPUT rules stay installed until PreDown removes them, so an abrupt
-# loss of the interface fails closed while a clean `wg-quick down` does not.
+# tunnel while the interface exists, but if the interface disappears without a
+# clean `wg-quick down`, the routes go with it and traffic silently falls back
+# to the normal gateway. These OUTPUT rules stay installed until PreDown
+# removes them, so losing the interface that way fails closed, while turning
+# the VPN off with `wg-quick down` does not.
+#
+# The rules live in memory only and nothing starts the tunnel at boot, so after
+# a restart the VPN is simply off and nothing is blocked until it is turned on.
 #
 # Both clauses are load-bearing. Handshake packets to the endpoint carry wg's
-# own fwmark and are exempt, and --dst-type LOCAL exempts loopback and
-# link-local; drop either and the rule blocks the very tunnel it protects.
+# own fwmark and are exempt -- without that the rule blocks the very tunnel it
+# protects. --dst-type LOCAL exempts traffic to this machine's own addresses,
+# loopback included -- without that it breaks local services, such as the
+# systemd-resolved DNS stub on 127.0.0.53.
 #
 # The hooks are added here rather than server-side in generate_client_config()
 # because WireGuard for Windows refuses configs containing PostUp/PreDown
@@ -196,18 +237,13 @@ log_success "Config written to ${WG_CONF}."
 echo "🚀 Starting WireGuard..."
 
 # A bring-up that fails partway can leave the REJECT rules installed, which
-# would take the user's internet down with it. Tear the interface back down
-# before reporting, so a failed install is never worse than no install.
+# would take the user's internet down with it. Tear the interface back down if
+# it is still there, which runs PreDown and removes them.
 if ! wg-quick up "$INTERFACE_NAME"; then
     wg-quick down "$INTERFACE_NAME" >/dev/null 2>&1 || true
-    error "wg-quick up failed. The tunnel was torn back down, so your connection is unaffected."
+    error "wg-quick up failed, and the tunnel was torn back down.
+${UP_FAILED_HINT}"
 fi
 
-systemctl enable "wg-quick@${INTERFACE_NAME}" 2>/dev/null || true
-
-log_success "Connected! VPN is active on interface ${INTERFACE_NAME}."
-echo
-echo -e "${BOLD}Kill switch is active.${NC} If the tunnel drops, traffic is blocked"
-echo "rather than falling back to your normal connection — including LAN access."
-echo "To go back online without the VPN, bring it down cleanly:"
-echo -e "  ${CYAN}sudo wg-quick down ${INTERFACE_NAME}${NC}"
+log_success "Connected! The VPN is on (interface ${INTERFACE_NAME})."
+print_usage

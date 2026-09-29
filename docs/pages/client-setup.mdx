@@ -94,11 +94,12 @@ sudo ./setupclient.sh
 
 1. Requires root, then checks `wg`, `curl`, `python3` and `iptables` are in
    `PATH`, and detects whether the kernel has IPv6 (`/proc/net/if_inet6`).
-2. **If `/etc/wireguard/wg0.conf` already exists** → runs `wg-quick up wg0`,
-   enables the unit, and exits. Re-running is safe and does not register a
-   second peer.
-3. Generates the keypair: `wg genkey`, then `wg pubkey`.
-4. Registers with the server, pinning its certificate key (on a CA-signed
+2. Turns off starting the VPN at boot (`wg-quick@wg0`) if an earlier version
+   of this script enabled it.
+3. **If `/etc/wireguard/wg0.conf` already exists** → turns the VPN on if it is
+   off, and exits. Re-running is safe and does not register a second peer.
+4. Generates the keypair: `wg genkey`, then `wg pubkey`.
+5. Registers with the server, pinning its certificate key (on a CA-signed
    server `-k --pinnedpubkey` is left out and curl validates normally):
    ```bash
    curl -sS --max-time 30 -k --pinnedpubkey "sha256//<pin>" -X POST \
@@ -107,14 +108,16 @@ sudo ./setupclient.sh
      -d '{"public_key": "<pubkey>"}' \
      https://<SERVER_IP>/addnewpeer
    ```
-5. Parses the JSON with `python3`, requires `status == "ok"`, and requires the
+6. Parses the JSON with `python3`, requires `status == "ok"`, and requires the
    assigned address to be inside `10.13.26.0/24`.
-6. Builds the config from the values `setup.sh` baked in, injects the kill
+7. Builds the config from the values `setup.sh` baked in, injects the kill
    switch hooks into the `[Interface]` section, and writes
    `/etc/wireguard/wg0.conf` with mode `600`.
-7. Runs `wg-quick up wg0` and `systemctl enable wg-quick@wg0` so the tunnel
-   survives a reboot. **If bring-up fails it tears the interface back down**,
-   so a half-applied kill switch can never strand you offline.
+8. Turns the VPN on with `wg-quick up wg0`. It stays on until you turn it off
+   or restart; nothing starts it at boot. **If bring-up fails, the script tears
+   the interface back down.** In the rare case that still leaves you without
+   internet, a kill switch rule was left behind — restart, or see
+   [I lost all internet after the VPN dropped](/faq#i-lost-all-internet-after-the-vpn-dropped).
 
 ### The generated config
 
@@ -145,25 +148,30 @@ would break every Windows client.
 
 ### The kill switch
 
-Those four rules are the kill switch. They reject any output that is not
-leaving through the tunnel, and they stay installed until `PreDown` removes
-them — so losing the interface abruptly fails closed, while a clean
-`wg-quick down` restores normal connectivity.
+Those four rules are the kill switch. While the VPN is on, they reject any
+output that is not leaving through the tunnel, and they stay installed until
+`PreDown` removes them — so if the interface disappears without a clean
+`wg-quick down`, traffic is blocked rather than falling back, while turning the
+VPN off with `wg-quick down` restores normal connectivity.
 
 Two clauses do the real work, and removing either breaks it:
 
 | Clause | Purpose |
 |---|---|
 | `! --mark $(wg show %i fwmark)` | Exempts WireGuard's own handshake packets, which carry that mark. Without it the rule blocks the tunnel it is protecting. |
-| `! --dst-type LOCAL` | Exempts loopback and link-local traffic. |
+| `! --dst-type LOCAL` | Exempts traffic to this machine's own addresses, loopback included. Without it, local services break — such as the `systemd-resolved` DNS stub on `127.0.0.53`. |
 
-Worth knowing about the two failure modes, because only one of them is the
-kill switch doing its job:
+What happens in each state:
 
 | State | Result |
 |---|---|
-| Interface gone (crash, sleep/resume, pre-boot) | **Blocked.** This is the kill switch. |
-| Interface up, peer unreachable | Blackholed by routing — traffic never leaves anyway. |
+| VPN on, interface removed without a clean `wg-quick down` | **Blocked.** This is the kill switch. |
+| VPN on, server unreachable | Blackholed by routing — traffic never leaves anyway. |
+| VPN off — after `wg-quick down`, or after a restart | Nothing blocked. Normal connection, no VPN. |
+
+The kill switch protects only while the VPN is on. The rules live in memory, and
+nothing starts the VPN at boot, so after a restart the machine uses your normal
+connection until you turn the VPN on again.
 
 <Callout type="warning">
   The kill switch blocks **LAN access too** — local printers, SSH to machines on
@@ -180,20 +188,25 @@ default IPv6 route into an interface that cannot route it, so those packets die
 locally. Without that line, a dual-stack client sends IPv6 straight out its
 normal interface and exposes its real address while everything appears to work.
 
-If IPv6 is disabled in your kernel, `setupclient.sh` detects it (`/proc/net/if_inet6`
+If the kernel has no IPv6 at all, `setupclient.sh` detects it (`/proc/net/if_inet6`
 is absent), leaves out `::/0` so `wg-quick` can start, and skips the `ip6tables`
 hooks. Nothing can leak over a stack that is not there.
 
-### Manage the tunnel
+### Turning it on and off
+
+The VPN is on only when you turn it on. It stays on until you turn it off or
+restart, and it does not start by itself after a restart.
 
 ```bash
-sudo wg show wg0          # peers, handshakes, transfer counters
-sudo wg-quick down wg0    # disconnect, and restore normal connectivity
-sudo wg-quick up wg0      # reconnect
+sudo wg-quick up wg0      # turn the VPN on
+sudo wg-quick down wg0    # turn it off, and restore normal connectivity
+sudo wg show wg0          # is it on? peers, handshakes, transfer counters
 
 sudo iptables  -S OUTPUT | grep REJECT   # confirm the kill switch is installed
 sudo ip6tables -S OUTPUT | grep REJECT
 ```
+
+Re-running `sudo ./setupclient.sh` on a configured device also turns it on.
 
 </Tabs.Tab>
 <Tabs.Tab>
@@ -350,7 +363,8 @@ server allocates the next free address — nothing needs doing on the server sid
 The pool holds **253 peers**, `10.13.26.2` through `10.13.26.254`.
 
 Re-running on a device that is *already* configured does not create a second
-peer: both scripts detect the existing config and simply bring the tunnel up.
+peer: both scripts detect the existing config. The Linux script turns the VPN
+on; the Windows script opens the WireGuard GUI so you can activate the tunnel.
 
 ## Removing a peer
 
