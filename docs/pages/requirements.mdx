@@ -77,6 +77,7 @@ WireGuard requires kernel 5.6+ (built-in) or the `wireguard` DKMS module. The Co
 | `wireguard-tools` | `apt install wireguard-tools` |
 | `curl` | `apt install curl` |
 | `python3` | `apt install python3` |
+| `iptables` | `apt install iptables` — the kill switch is built from its rules |
 | root / sudo | required |
 
 ## Windows Client
@@ -93,3 +94,10 @@ WireGuard requires kernel 5.6+ (built-in) or the `wireguard` DKMS module. The Co
 > needed. Install one anyway and `setup.sh` renders normal validation instead —
 > see [Customization](/customization). On Windows the pinned request goes
 > through the `curl.exe` that ships with Windows 10 1803 and later.
+
+## Phone or Tablet
+
+| Requirement | Notes |
+|---|---|
+| WireGuard app | The official app, from the App Store or Google Play |
+| SSH access to the server | To run `add-device.sh` — see [Phones and tablets](/client-setup#phones-and-tablets) |

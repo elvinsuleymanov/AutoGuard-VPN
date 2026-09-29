@@ -233,7 +233,8 @@ function IsClientAddress($Address) {
 }
 
 # Mirrors generate_client_config() in auth/helpers.py, which clients rendered
-# before this script built its own config still rely on. Keep the two in step.
+# before this script built its own config still rely on. Keep all copies in
+# step; helpers.py lists them.
 function BuildClientConfig($PrivateKey, $Address) {
     $lines = @(
         "[Interface]"

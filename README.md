@@ -50,9 +50,17 @@ sudo ./setupclient.sh          # Linux
 It generates its own keypair, registers itself, and connects. No config files to
 copy around, nothing to edit on the server.
 
+**Phones and tablets** generate their keypair in the WireGuard app; register
+the public key from the server and it prints what to enter:
+
+```bash
+./add-device.sh <public key from the app>
+```
+
 Afterwards you turn the VPN on and off yourself: `sudo wg-quick up wg0` /
 `sudo wg-quick down wg0` on Linux, where it does not start by itself after a
-restart, and Activate / Deactivate in the WireGuard app on Windows.
+restart, Activate / Deactivate in the WireGuard app on Windows, and the
+tunnel's switch in the app on phones.
 
 > Updating later is the same one command: `git pull && ./setup.sh`
 
@@ -84,6 +92,7 @@ restart, and Activate / Deactivate in the WireGuard app on Windows.
 | **Open ports** | `443/tcp` (registration) and `51820/udp` (tunnel) |
 | **Linux client** | `wireguard-tools`, `curl`, `python3`, `iptables` |
 | **Windows client** | Windows 10/11, Administrator — WireGuard installs itself |
+| **Phone / tablet** | The WireGuard app (App Store / Google Play) |
 
 Nothing else on the host: keys and certificates are generated inside a throwaway
 container, so no `openssl` or `wg` binary is needed.

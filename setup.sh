@@ -614,6 +614,9 @@ $(echo -e "${CYAN}${BOLD}Next steps${NC}")
     ./scripts/setupclient.sh    — Linux, run as root
     ./scripts/setupclient.ps1   — Windows, run as Administrator
 
+  Phones and tablets: generate a keypair in the WireGuard app, then run
+    ./add-device.sh <the public key it shows>
+
   Pi-hole admin is bound to localhost only. Reach it either over the VPN at
     http://${IP_PIHOLE}/admin
   or through an SSH tunnel:

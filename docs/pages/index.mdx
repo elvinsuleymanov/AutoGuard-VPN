@@ -62,6 +62,10 @@ sudo ./setupclient.sh          # Linux
 The client generates its own keypair, registers the public half, writes the
 config, and brings the tunnel up.
 
+For a phone or tablet, generate the keypair in the WireGuard app and run
+`./add-device.sh <public key>` on the server — see
+[Phones and tablets](/client-setup#phones-and-tablets).
+
 </Steps>
 
 <Callout type="warning">
@@ -146,7 +150,7 @@ single deployment holds up to 253 peers. The server itself is `10.13.26.1`.
     What `setup.sh` does, step by step, and every flag it takes.
   </Cards.Card>
   <Cards.Card title="Client Setup" href="/client-setup" arrow>
-    Connecting Linux and Windows clients, and managing tunnels.
+    Connecting Linux and Windows clients and phones, and managing tunnels.
   </Cards.Card>
   <Cards.Card title="Architecture" href="/architecture" arrow>
     Peer lifecycle, IP allocation, and the DNS chain.

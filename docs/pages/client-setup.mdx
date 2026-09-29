@@ -12,6 +12,9 @@ After `setup.sh` runs on the server, `scripts/setupclient.sh` and
 server address and registration token — copy the right one to the client and run
 it with root or Administrator rights.
 
+Phones and tablets have no script: you add them from the server with
+`add-device.sh` — see [Phones and tablets](#phones-and-tablets).
+
 <Callout type="warning">
   These rendered scripts hold a live bearer token and are gitignored for that
   reason. Move them over a channel you trust. If one leaks, rotate with
@@ -321,6 +324,81 @@ Start-Service "WireGuardTunnel`$wg0"
 </Tabs.Tab>
 </Tabs>
 
+## Phones and tablets
+
+Phones and tablets cannot run the setup scripts, so they are added from the
+server instead — without giving up the rule that a device's private key never
+leaves it. The device generates its own keypair; the server only ever sees the
+public half.
+
+<Steps>
+
+### Generate the keypair on the device
+
+Install the official WireGuard app from the App Store or Google Play. Tap **+**,
+choose **Create from scratch**, name the tunnel, and tap **Generate keypair** (on
+Android, the generate button next to the private key). Copy the **public** key it
+shows.
+
+### Get the public key to the server
+
+It is not secret, so any channel works — a message to yourself, an email, a
+note. Never send the private key.
+
+### Register it
+
+On the server, from the repository root:
+
+```bash
+./add-device.sh <public-key>
+```
+
+It registers the key through the same API the client scripts use, prints the
+values to enter, and shows the server's public key as a QR code.
+
+### Fill in the tunnel
+
+Enter the printed values:
+
+| Section | Field | Value |
+|---|---|---|
+| Interface | Addresses | the address it printed, e.g. `10.13.26.7/32` |
+| Interface | DNS servers | `172.29.144.30` |
+| Peer (**Add peer**) | Public key | scan the QR code with the device's camera, copy, paste |
+| Peer | Endpoint | `<server>:51820` |
+| Peer | Allowed IPs | `0.0.0.0/0, ::/0` |
+| Peer | Persistent keepalive | `25` |
+
+Leave the other fields as they are. Save the tunnel and switch it on.
+
+</Steps>
+
+<Callout type="warning">
+  On Android, leave **Exclude private IPs** unchecked. It would send the DNS
+  server `172.29.144.30` around the tunnel, and name resolution would stop
+  working.
+</Callout>
+
+What this keeps from the scripts' guarantees:
+
+| | |
+|---|---|
+| **Private key** | Generated in the WireGuard app and never leaves the device |
+| **Server identity** | You register over SSH, which already verifies the server, and its WireGuard key reaches the device through the camera rather than the network |
+| **Registration token** | Never on the device — registration happens on the server |
+
+The tunnel itself is the same one the scripts set up: an address from
+`10.13.26.0/24`, Pi-hole for DNS, and `0.0.0.0/0, ::/0` so all traffic goes
+through it. You turn it on and off with the tunnel's switch in the app.
+
+**Kill switch.** On Android, open WireGuard in the system VPN settings and turn
+on **Always-on VPN** and **Block connections without VPN**; traffic is then
+blocked whenever the tunnel is not up. On iOS, the tunnel's **On-Demand**
+settings can switch it on automatically.
+
+To remove a phone later, follow [Removing a peer](#removing-a-peer) with the
+address `add-device.sh` printed.
+
 ## How the script recognises your server
 
 No CA-signed certificate is needed. `setup.sh` knows the certificate nginx
@@ -358,9 +436,9 @@ talk to the registration API again.
 
 ## Adding more clients
 
-Run the script on each new device. Every run generates a fresh keypair and the
-server allocates the next free address — nothing needs doing on the server side.
-The pool holds **253 peers**, `10.13.26.2` through `10.13.26.254`.
+Run the script on each new computer — or `add-device.sh` for each phone or
+tablet. Every device gets its own keypair and the next free address. The pool
+holds **253 peers**, `10.13.26.2` through `10.13.26.254`, shared by all of them.
 
 Re-running on a device that is *already* configured does not create a second
 peer: both scripts detect the existing config. The Linux script turns the VPN
