@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="AutoGuard VPN" height="150">
+  <img src=".github/assets/logo.png" alt="AutoGuard VPN" height="150">
 </p>
 
 <h2 align="center">AutoGuard VPN</h2>
@@ -57,7 +57,7 @@ restart, and Activate / Deactivate in the WireGuard app on Windows.
 > Updating later is the same one command: `git pull && ./setup.sh`
 
 <p align="center">
-  <img src="assets/usage_phase.svg" alt="How traffic flows once connected" width="620">
+  <img src=".github/assets/usage_phase.svg" alt="How traffic flows once connected" width="620">
 </p>
 
 ## What you get
