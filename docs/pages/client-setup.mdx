@@ -30,11 +30,12 @@ matters for security:
 `wg genkey` on the client. **The private key never leaves the device** and is
 never transmitted, logged, or stored on the server.
 
-### Only the public key is sent
+### Only the public key is sent — and only to your server
 
 A single `POST` to `https://<server>/addnewpeer` carrying the public key and the
-`X-Auth-Token` header. An attacker who captures this request learns a public key
-and a token — never an identity they can use as this peer.
+`X-Auth-Token` header. Before sending it, the script checks that the server
+presents the certificate key `setup.sh` pinned into it, and aborts otherwise — see
+[How the script recognises your server](#how-the-script-recognises-your-server).
 
 ### The server allocates an address
 
@@ -43,10 +44,12 @@ free one in `10.13.26.2`–`10.13.26.254`, and writes the peer file. `peer-watch
 picks it up through `inotifywait` and applies it with `wg addconf` — no restart,
 no dropped peers.
 
-### The config comes back with a placeholder
+### The client builds its own config
 
-The returned config contains the literal `<PASTE_YOUR_PRIVATE_KEY_HERE>`, which
-the client substitutes with the key it generated in step 1.
+Only the assigned address is taken from the reply, and it must fall inside
+`10.13.26.0/24`. The server's WireGuard key, endpoint and DNS come from values
+`setup.sh` wrote into the script, so a forged reply cannot point the tunnel at
+another server. The private key from step 1 goes straight into that config.
 
 ### The tunnel comes up
 
@@ -95,17 +98,20 @@ sudo ./setupclient.sh
    enables the unit, and exits. Re-running is safe and does not register a
    second peer.
 3. Generates the keypair: `wg genkey`, then `wg pubkey`.
-4. Registers with the server:
+4. Registers with the server, pinning its certificate key (on a CA-signed
+   server `-k --pinnedpubkey` is left out and curl validates normally):
    ```bash
-   curl -sk -X POST \
+   curl -sS --max-time 30 -k --pinnedpubkey "sha256//<pin>" -X POST \
      -H "Content-Type: application/json" \
      -H "X-Auth-Token: <token>" \
      -d '{"public_key": "<pubkey>"}' \
      https://<SERVER_IP>/addnewpeer
    ```
-5. Parses the JSON with `python3` and requires `status == "ok"`.
-6. Substitutes the private key, injects the kill switch hooks into the
-   `[Interface]` section, and writes `/etc/wireguard/wg0.conf` with mode `600`.
+5. Parses the JSON with `python3`, requires `status == "ok"`, and requires the
+   assigned address to be inside `10.13.26.0/24`.
+6. Builds the config from the values `setup.sh` baked in, injects the kill
+   switch hooks into the `[Interface]` section, and writes
+   `/etc/wireguard/wg0.conf` with mode `600`.
 7. Runs `wg-quick up wg0` and `systemctl enable wg-quick@wg0` so the tunnel
    survives a reboot. **If bring-up fails it tears the interface back down**,
    so a half-applied kill switch can never strand you offline.
@@ -175,7 +181,7 @@ locally. Without that line, a dual-stack client sends IPv6 straight out its
 normal interface and exposes its real address while everything appears to work.
 
 If IPv6 is disabled in your kernel, `setupclient.sh` detects it (`/proc/net/if_inet6`
-is absent), strips `::/0` so `wg-quick` can start, and skips the `ip6tables`
+is absent), leaves out `::/0` so `wg-quick` can start, and skips the `ip6tables`
 hooks. Nothing can leak over a stack that is not there.
 
 ### Manage the tunnel
@@ -229,10 +235,13 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    `wg0.conf.dpapi` is already in the store, it opens the GUI and stops — it
    will not register a second peer.
 4. Generates the keypair with `wg.exe genkey` and `wg.exe pubkey`.
-5. Registers via `Invoke-RestMethod`, then removes any tunnel an older version
-   of this script installed from `C:\ProgramData\WireGuard`.
-6. Writes the config into the store and grants `SYSTEM` and `Administrators`
-   access with `icacls`.
+5. Registers — through the built-in `curl.exe` with the certificate key pinned,
+   or through `Invoke-RestMethod` when the server's certificate is CA-signed —
+   checks the assigned address is inside `10.13.26.0/24`, then removes any
+   tunnel an older version of this script installed from
+   `C:\ProgramData\WireGuard`.
+6. Builds the config from the values `setup.sh` baked in, writes it into the
+   store, and grants `SYSTEM` and `Administrators` access with `icacls`.
 7. **Imports it into the manager** by restarting `WireGuardManager` and waiting
    for the plaintext `wg0.conf` to become the encrypted `wg0.conf.dpapi`. That
    conversion is what makes the tunnel appear in the GUI.
@@ -281,28 +290,6 @@ in. This reports only; it never fails the install.
   the GUI to reach local printers, network shares, or your router's admin page.
 </Callout>
 
-### TLS validation
-
-Whether the script validates the server's certificate is decided by
-`setup.sh` at render time, from the certificate the server actually presents:
-
-| Server certificate | Client behaviour |
-|---|---|
-| CA-signed | Validates normally — no bypass of any kind is rendered into the script |
-| Self-signed | Skips validation, because there is nothing to validate against |
-
-When validation is skipped, the mechanism depends on your PowerShell version —
-`-SkipCertificateCheck` on 7+, a `ServerCertificateValidationCallback` on 5.1.
-Either way it applies only to the one-off registration request, never to the
-WireGuard tunnel, which authenticates with its own key exchange.
-
-<Callout type="warning">
-  While the server is on a self-signed certificate, anyone able to intercept
-  that first registration request can capture the token in it. Installing a
-  CA-signed certificate closes this — see
-  [Customization](/customization).
-</Callout>
-
 ### Manage the tunnel
 
 Use **Activate / Deactivate** in the WireGuard GUI, or from an Administrator
@@ -320,6 +307,41 @@ Start-Service "WireGuardTunnel`$wg0"
 
 </Tabs.Tab>
 </Tabs>
+
+## How the script recognises your server
+
+No CA-signed certificate is needed. `setup.sh` knows the certificate nginx
+serves, so it writes that certificate's key fingerprint into both scripts, along
+with the server's WireGuard public key:
+
+| Server certificate | Client behaviour |
+|---|---|
+| Self-signed (default) | **Pinned.** CA and expiry checks are skipped, but any key other than the pinned one is refused |
+| CA-signed | Validated normally against the system trust store; nothing is pinned, because a CA renewal may change the key |
+
+On Linux the pin is `curl -k --pinnedpubkey sha256//<pin>`; on Windows the same
+flags go to the built-in `curl.exe`, because `Invoke-RestMethod` can only
+validate against the trust store or skip validation entirely. On a mismatch
+curl aborts **before sending anything**, so an interceptor never sees the token.
+
+Two layers, protecting different things:
+
+- **The pin protects the token.** Only a server holding the pinned key receives
+  the registration request.
+- **The baked-in WireGuard key protects the tunnel.** The script builds its own
+  config and takes only the assigned address from the reply, so even a forged
+  reply cannot redirect the tunnel — WireGuard's handshake only completes with
+  the server holding that key.
+
+The pin changes only when `setup.sh` issues a new certificate (`--force`, or a
+new address). Scripts rendered before that refuse to register and say so — fetch
+fresh ones from `scripts/`. Devices already connected are unaffected; they never
+talk to the registration API again.
+
+<Callout type="warning">
+  The script itself is now what proves your server's identity. Move it to the
+  device over a channel you trust — `scp`, USB — not email or chat.
+</Callout>
 
 ## Adding more clients
 

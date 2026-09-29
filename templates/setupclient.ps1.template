@@ -4,12 +4,26 @@ $ServerPublicIp = "PLACEHOLDER_SERVER_PUBLIC_IP"
 $InterfaceName  = "PLACEHOLDER_INTERFACE_NAME"
 $AuthKey        = "PLACEHOLDER_AUTH_KEY"
 
-# Set by setup.sh from the certificate the server actually presents. Validation
-# is skipped only when that certificate is self-signed, leaving a client nothing
-# to validate against. Hardcoding the skip meant installing a real certificate
-# changed nothing -- clients kept accepting any certificate, so $AuthKey above
-# stayed interceptable by anyone on the path.
+# Everything the tunnel config needs is written in here by setup.sh rather than
+# taken from the registration response. Only the assigned address comes over
+# the network, and it has to fall inside $SubnetPrefix. A forged response
+# therefore cannot point the tunnel at another server or swap the DNS server.
+$ServerWgKey    = "PLACEHOLDER_SERVER_WG_KEY"
+$ServerWgPort   = "PLACEHOLDER_WG_PORT"
+$DnsServer      = "PLACEHOLDER_DNS_SERVER"
+$SubnetPrefix   = "PLACEHOLDER_SUBNET_PREFIX"
+
+# Set by setup.sh from the certificate the server actually presents. A CA-signed
+# certificate is validated normally. A self-signed one, which no CA vouches for,
+# is pinned instead: the CA and expiry checks are skipped, but any key other
+# than $TlsPin -- the SHA-256 of this server's certificate key -- is refused
+# before anything is sent. An interceptor cannot present that key, so $AuthKey
+# only ever reaches this server.
 $VerifyTls = "PLACEHOLDER_VERIFY_TLS" -ne "no"
+$TlsPin    = "PLACEHOLDER_TLS_PIN"
+
+# The shape of a base64-encoded 32-byte value: a WireGuard key or a SHA-256.
+$KeyPattern = '^[A-Za-z0-9+/]{43}=$'
 
 $WgExe = "C:\Program Files\WireGuard\wg.exe"
 $WgGui = "C:\Program Files\WireGuard\wireguard.exe"
@@ -27,12 +41,8 @@ $LegacyDir = "C:\ProgramData\WireGuard"
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     # TLS 1.2 is not enabled by default on the .NET Framework that PowerShell
     # 5.1 runs on. This is about which protocol versions are offered, not about
-    # trust, so it applies either way.
+    # trust.
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-
-    if (-not $VerifyTls) {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-    }
 }
 
 function CheckWireGuard {
@@ -121,33 +131,130 @@ function GenerateKeypair {
     @{ Private = $priv; Public = $pub }
 }
 
+# Checked before anything talks to the server: a failure past registration
+# leaves an address allocated that nothing will ever claim.
+function AssertRendered {
+    if ($ServerWgKey -notmatch $KeyPattern) {
+        Write-Host "This script has no valid server key. Use the copy setup.sh generated in scripts/." -ForegroundColor Red
+        exit 1
+    }
+    if (-not $VerifyTls -and $TlsPin -notmatch $KeyPattern) {
+        Write-Host "This script has no valid certificate fingerprint. Use the copy setup.sh generated in scripts/." -ForegroundColor Red
+        exit 1
+    }
+}
+
+function WriteUnreachableHint {
+    Write-Host ""
+    Write-Host "If the API was never reached at all, check TCP 443 is open to" -ForegroundColor Yellow
+    Write-Host "$ServerPublicIp in your cloud firewall, and that nginx_proxy is running" -ForegroundColor Yellow
+    Write-Host "on the server." -ForegroundColor Yellow
+}
+
 function RegisterPeer($PublicKey) {
+    if ($VerifyTls) { return RegisterPeerValidated $PublicKey }
+    return RegisterPeerPinned $PublicKey
+}
+
+# CA-signed server: validate against the Windows trust store like any other site.
+function RegisterPeerValidated($PublicKey) {
     $body    = @{ public_key = $PublicKey } | ConvertTo-Json -Compress
     $headers = @{ "X-Auth-Token" = $AuthKey; "Content-Type" = "application/json" }
     $uri     = "https://$ServerPublicIp/addnewpeer"
 
-    $params = @{ Uri = $uri; Method = "POST"; Headers = $headers; Body = $body }
-    if (-not $VerifyTls -and $PSVersionTable.PSVersion.Major -ge 7) {
-        $params["SkipCertificateCheck"] = $true
-    }
-
-    try { Invoke-RestMethod @params }
+    try { Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -Body $body }
     catch {
         Write-Host "Registration failed: $_" -ForegroundColor Red
-        Write-Host ""
-        Write-Host "If that says 'Unable to connect to the remote server', the API was" -ForegroundColor Yellow
-        Write-Host "never reached at all. Check TCP 443 is open to $ServerPublicIp in your" -ForegroundColor Yellow
-        Write-Host "cloud firewall, and that nginx_proxy is running on the server." -ForegroundColor Yellow
+        WriteUnreachableHint
         exit 1
     }
+}
+
+# Self-signed server: pin its key. Invoke-RestMethod can only validate against
+# the trust store or skip validation entirely -- it cannot accept one specific
+# certificate and refuse every other. curl.exe can, and has shipped with
+# Windows since 10 1803.
+function RegisterPeerPinned($PublicKey) {
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if (-not (Test-Path $curl)) {
+        Write-Host "curl.exe was not found at $curl. It ships with Windows 10 1803 and later." -ForegroundColor Red
+        exit 1
+    }
+
+    # The body goes through a file rather than an argument, because Windows
+    # PowerShell 5.1 strips the double quotes out of JSON passed to a native
+    # command. It holds only the public key.
+    $bodyFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $body = @{ public_key = $PublicKey } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($bodyFile, $body, (New-Object System.Text.UTF8Encoding $false))
+
+        $output = & $curl -sS --max-time 30 -k --pinnedpubkey "sha256//$TlsPin" `
+            -X POST `
+            -H "Content-Type: application/json" `
+            -H "X-Auth-Token: $AuthKey" `
+            --data-binary "@$bodyFile" `
+            "https://$ServerPublicIp/addnewpeer"
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($exitCode -eq 90) {
+        Write-Host "The server presented a different certificate than the one this script was" -ForegroundColor Red
+        Write-Host "generated for, so nothing was sent. Either something is intercepting the" -ForegroundColor Red
+        Write-Host "connection, or the server's certificate changed (setup.sh --force, or a new" -ForegroundColor Red
+        Write-Host "address). Get a freshly generated setupclient.ps1 from the server's scripts/." -ForegroundColor Red
+        exit 1
+    }
+    if ($exitCode -ne 0) {
+        Write-Host "Registration failed: curl exit $exitCode." -ForegroundColor Red
+        WriteUnreachableHint
+        exit 1
+    }
+
+    try { $parsed = ($output -join "`n") | ConvertFrom-Json }
+    catch {
+        Write-Host "The server's reply was not JSON: $output" -ForegroundColor Red
+        exit 1
+    }
+    return $parsed
+}
+
+# The server only ever allocates .2 through .254 of its own /24.
+function IsClientAddress($Address) {
+    $pattern = '^' + [regex]::Escape($SubnetPrefix) + '\.([0-9]{1,3})$'
+    if ("$Address" -match $pattern) {
+        $last = [int]$Matches[1]
+        return ($last -ge 2 -and $last -le 254)
+    }
+    return $false
+}
+
+# Mirrors generate_client_config() in auth/helpers.py, which clients rendered
+# before this script built its own config still rely on. Keep the two in step.
+function BuildClientConfig($PrivateKey, $Address) {
+    $lines = @(
+        "[Interface]"
+        "PrivateKey = $PrivateKey"
+        "Address = $Address/32"
+        "DNS = $DnsServer"
+        ""
+        "[Peer]"
+        "PublicKey = $ServerWgKey"
+        "Endpoint = ${ServerPublicIp}:$ServerWgPort"
+        "AllowedIPs = 0.0.0.0/0, ::/0"
+        "PersistentKeepalive = 25"
+    )
+    return ($lines -join "`n") + "`n"
 }
 
 # Writes the config as plaintext into the store. The manager encrypts it to
 # <name>.conf.dpapi on its next start, which is also what makes it appear in
 # the GUI.
-function WriteConfigToStore($Config, $PrivateKey, $Name) {
+function WriteConfigToStore($Config, $Name) {
     $path   = Join-Path $StoreDir "$Name.conf"
-    $Config = $Config -replace "<PASTE_YOUR_PRIVATE_KEY_HERE>", $PrivateKey
     [System.IO.File]::WriteAllText($path, $Config, (New-Object System.Text.UTF8Encoding $false))
 
     # The manager runs as SYSTEM and has to read this to import it. The store
@@ -279,6 +386,8 @@ if ($existing) {
     exit 0
 }
 
+AssertRendered
+
 Write-Host "Generating keypair..." -ForegroundColor Cyan
 $Keys = GenerateKeypair
 
@@ -288,6 +397,10 @@ if ($Response.status -ne "ok") {
     Write-Host "Server rejected: $($Response | ConvertTo-Json)" -ForegroundColor Red
     exit 1
 }
+if (-not (IsClientAddress $Response.ip)) {
+    Write-Host "Server assigned an address outside $SubnetPrefix.0/24: '$($Response.ip)'" -ForegroundColor Red
+    exit 1
+}
 Write-Host "Assigned IP: $($Response.ip)" -ForegroundColor Green
 
 # Only now, with a working replacement config in hand. Tearing the old tunnel
@@ -295,7 +408,8 @@ Write-Host "Assigned IP: $($Response.ip)" -ForegroundColor Green
 # registration failed -- a dead token or a closed port and they are stranded.
 RemoveOrphanedTunnels
 
-$PlainPath = WriteConfigToStore -Config $Response.config -PrivateKey $Keys.Private -Name $InterfaceName
+$Config    = BuildClientConfig -PrivateKey $Keys.Private -Address $Response.ip
+$PlainPath = WriteConfigToStore -Config $Config -Name $InterfaceName
 
 if (-not (ImportIntoManager $InterfaceName)) {
     Write-Host ""
@@ -319,7 +433,7 @@ if (-not (VerifyHandshake $InterfaceName)) {
     Stop-Service (ServiceNameFor $InterfaceName) -ErrorAction SilentlyContinue
     Write-Host ""
     Write-Host "The tunnel stays in the GUI, so you can retry with Activate." -ForegroundColor Yellow
-    Write-Host "Check UDP 51820 is open to $ServerPublicIp, then on the server run:" -ForegroundColor Yellow
+    Write-Host "Check UDP $ServerWgPort is open to $ServerPublicIp, then on the server run:" -ForegroundColor Yellow
     Write-Host "  docker exec wireguard wg show wg0" -ForegroundColor Yellow
     Write-Host "Your peer pubkey: $($Keys.Public)" -ForegroundColor Yellow
     Start-Process $WgGui

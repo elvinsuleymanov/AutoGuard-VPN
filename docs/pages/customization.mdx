@@ -139,6 +139,10 @@ streamed back over stdout for the host to write — a bind mount would leave
 root-owned files behind and silently write nowhere under Docker Desktop. The
 certificate is reissued automatically whenever the public IP changes.
 
+The client scripts pin this certificate's key, so the self-signed default is
+already safe against interception — a CA-signed certificate is optional. See
+[Client Setup](/client-setup#how-the-script-recognises-your-server).
+
 ### Using a real certificate
 
 <Steps>

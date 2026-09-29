@@ -76,6 +76,11 @@ def _server_public_key() -> str:
 
 
 def generate_client_config(client_ip: str) -> str:
+    # Current client scripts ignore this and build the same config from values
+    # setup.sh wrote into them, taking only the address from the response, so
+    # a forged response cannot redirect their tunnel. Scripts rendered before
+    # that change still use it. Keep it in step with BuildClientConfig in
+    # setupclient.ps1.template and WG_CONFIG in setupclient.sh.template.
     pubkey = _server_public_key()
     # ::/0 is here to *blackhole* IPv6, not to carry it. The tunnel is IPv4-only
     # -- Address is a /32 and the server has no IPv6 -- so without this line a

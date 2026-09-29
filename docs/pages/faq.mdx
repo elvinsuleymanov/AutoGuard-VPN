@@ -37,30 +37,38 @@ If the interface genuinely is not `eth0`, edit `templates/wg0.conf.template`
 Otherwise check `net.ipv4.ip_forward` on the host and that your cloud firewall
 allows outbound traffic.
 
+## "The server presented a different certificate than the one this script was generated for"
+
+The script pins the server's certificate key and refused to send anything,
+because the server presented a different one. Two causes:
+
+- **The certificate changed.** `setup.sh --force`, or a run with a new
+  address, issues a new certificate. Scripts rendered before that no longer
+  match — use the fresh ones from `scripts/`.
+- **Something is intercepting the connection.** If the certificate did not
+  change, do not work around this; try from another network.
+
 ## Registration fails with an SSL certificate error
 
-Expected while the server is on a self-signed certificate — the client scripts
-handle it automatically, and `setup.sh` turns validation back on by itself once
-you install a CA-signed one.
+On a self-signed server the scripts pin the certificate rather than validate it,
+so this should not happen. If you see it **after** installing a real
+certificate, the scripts were rendered before it was in place. Re-run
+`./setup.sh` and redistribute `scripts/`; the run should report `CA-signed
+certificate — client scripts will validate TLS normally.`
 
-If you see this **after** installing a real certificate, the scripts were
-rendered before it was in place. Re-run `./setup.sh` and redistribute
-`scripts/`; the run should report `CA-signed certificate — client scripts will
-validate TLS normally.`
-
-When calling the API manually against a self-signed server:
+When calling the API manually against a self-signed server, pin it the same
+way. `setup.sh` prints the fingerprint as `sha256//<pin>`:
 
 ```bash
-curl -sk -X POST \
+curl -sS -k --pinnedpubkey "sha256//<pin>" -X POST \
   -H "Content-Type: application/json" \
   -H "X-Auth-Token: <token>" \
   -d '{"public_key":"..."}' \
   https://<SERVER>/addnewpeer
 ```
 
-PS 7+: `Invoke-RestMethod -SkipCertificateCheck ...`
-
-PS 5.1: `[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}`
+On Windows, call `curl.exe` explicitly with the same flags — in Windows
+PowerShell 5.1, plain `curl` is an alias for `Invoke-WebRequest`.
 
 ## `docker compose up` fails before running setup.sh
 

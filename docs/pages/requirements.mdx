@@ -88,8 +88,8 @@ WireGuard requires kernel 5.6+ (built-in) or the `wireguard` DKMS module. The Co
 | WireGuard for Windows | Auto-installed via `winget` if absent |
 
 > By default the server uses a **self-signed TLS certificate**, and the client
-> scripts skip validation for the one-off registration request because there is
-> nothing to validate against. Install a CA-signed certificate and `setup.sh`
-> renders validation back on automatically — see
-> [Customization](/customization). Either way this concerns only registration,
-> never the WireGuard tunnel, which authenticates with its own key exchange.
+> scripts **pin** it: `setup.sh` writes the certificate's key fingerprint into
+> them, and they refuse any other key. No domain or CA-signed certificate is
+> needed. Install one anyway and `setup.sh` renders normal validation instead —
+> see [Customization](/customization). On Windows the pinned request goes
+> through the `curl.exe` that ships with Windows 10 1803 and later.

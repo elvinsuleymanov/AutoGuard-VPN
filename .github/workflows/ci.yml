@@ -124,6 +124,23 @@ jobs:
           grep -q "$token" scripts/setupclient.ps1
           echo "client scripts carry the live token"
 
+      - name: Client scripts must pin the certificate nginx serves
+        run: |
+          pin=$(openssl x509 -in certs/fullchain.pem -pubkey -noout \
+                | openssl pkey -pubin -outform DER \
+                | openssl dgst -sha256 -binary \
+                | openssl base64 -A)
+          grep -qF "TLS_PIN=\"$pin\"" scripts/setupclient.sh
+          grep -qF "\$TlsPin    = \"$pin\"" scripts/setupclient.ps1
+          echo "client scripts pin sha256//$pin"
+
+      - name: Client scripts must carry the server's WireGuard key
+        run: |
+          key=$(cat wireguard/keys/server_public.key)
+          grep -qF "SERVER_WG_KEY=\"$key\"" scripts/setupclient.sh
+          grep -qF "\$ServerWgKey    = \"$key\"" scripts/setupclient.ps1
+          echo "client scripts carry the live server key"
+
       - name: No placeholders may survive rendering
         run: |
           ! grep -rn "PLACEHOLDER\|your-private-key\|your-server-address\|server_name public_ip" \

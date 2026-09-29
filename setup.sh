@@ -322,6 +322,25 @@ Is it a valid PEM certificate?"
     esac
 }
 
+# SHA-256 of the certificate's public key, base64, in the form curl's
+# --pinnedpubkey takes. It is the key that gets pinned rather than the whole
+# certificate, so the pin keeps working after the certificate expires: clients
+# skip the CA and expiry checks but still refuse any other key.
+tls_pin() {
+    local cert="$1" out
+    out=$(docker run --rm -i "$CRYPTO_IMAGE" sh -ec '
+        apk add --no-cache openssl >/dev/null 2>&1
+        openssl x509 -pubkey -noout \
+            | openssl pkey -pubin -outform DER \
+            | openssl dgst -sha256 -binary \
+            | openssl base64 -A
+    ' < "$cert") || error "Could not compute the fingerprint of ${cert}."
+
+    [[ "$out" =~ ^[A-Za-z0-9+/]{43}=$ ]] \
+        || error "Unexpected fingerprint for ${cert}: '${out}'"
+    printf '%s' "$out"
+}
+
 # ------------------------------------------------------------------------------
 # Load existing configuration
 # ------------------------------------------------------------------------------
@@ -448,16 +467,19 @@ else
     CERT_SELF_SIGNED=$(detect_self_signed "$CERTS_DIR/fullchain.pem")
 fi
 
-# Client scripts skip TLS validation only when the server has nothing a client
-# could validate against. Hardcoding the skip meant that installing a real
-# certificate changed nothing: clients went on accepting any certificate at
-# all, which looks secure and is not.
+# A self-signed certificate has no CA a client could validate it against, so
+# the client scripts pin its key instead: they skip the CA and expiry checks
+# but refuse any other key, which an interceptor cannot present. A CA-signed
+# certificate is validated normally and nothing is pinned, because a CA
+# renewal is free to change the key.
 if [ "$CERT_SELF_SIGNED" = "yes" ]; then
     VERIFY_TLS="no"
-    log_warn "Self-signed certificate — client scripts will skip TLS validation."
-    log_info "Install a CA-signed certificate in ${CERTS_DIR}/ and re-run to enable it."
+    TLS_PIN=$(tls_pin "$CERTS_DIR/fullchain.pem")
+    log_success "Self-signed certificate — client scripts will pin it (sha256//${TLS_PIN})."
+    log_info "Install a CA-signed certificate in ${CERTS_DIR}/ and re-run to validate it normally instead."
 else
     VERIFY_TLS="yes"
+    TLS_PIN=""
     log_success "CA-signed certificate — client scripts will validate TLS normally."
 fi
 
@@ -481,16 +503,30 @@ chmod 600 "./wireguard/wg_confs/wg0.conf"
 render "$TEMPLATE_DIR/nginx.conf.template" "./nginx/nginx.conf" \
     "public_ip" "$PUBLIC_IP"
 
+# The client scripts get everything their tunnel config needs from here, not
+# from the registration response, so a forged response cannot redirect the
+# tunnel. The server key, port, DNS and subnet must therefore match what
+# generate_client_config() in auth/helpers.py would hand out.
 render "$TEMPLATE_DIR/setupclient.sh.template" "./scripts/setupclient.sh" \
     "PLACEHOLDER-PUBLIC-IP"     "$PUBLIC_IP" \
     "PLACEHOLDER-INTERFACE-NAME" "$INTERFACE_NAME" \
     "PLACEHOLDER-VERIFY-TLS"    "$VERIFY_TLS" \
+    "PLACEHOLDER-TLS-PIN"       "$TLS_PIN" \
+    "PLACEHOLDER-SERVER-WG-KEY" "$SERVER_PUBLIC_KEY" \
+    "PLACEHOLDER-WG-PORT"       "$PORT_WG" \
+    "PLACEHOLDER-DNS-SERVER"    "$IP_PIHOLE" \
+    "PLACEHOLDER-SUBNET-PREFIX" "${INTERNAL_SUBNET%.*}" \
     "PLACEHOLDER-AUTH_KEY"      "$REGISTRATION_TOKEN"
 
 render "$TEMPLATE_DIR/setupclient.ps1.template" "./scripts/setupclient.ps1" \
     "PLACEHOLDER_SERVER_PUBLIC_IP" "$PUBLIC_IP" \
     "PLACEHOLDER_INTERFACE_NAME"   "$INTERFACE_NAME" \
     "PLACEHOLDER_VERIFY_TLS"       "$VERIFY_TLS" \
+    "PLACEHOLDER_TLS_PIN"          "$TLS_PIN" \
+    "PLACEHOLDER_SERVER_WG_KEY"    "$SERVER_PUBLIC_KEY" \
+    "PLACEHOLDER_WG_PORT"          "$PORT_WG" \
+    "PLACEHOLDER_DNS_SERVER"       "$IP_PIHOLE" \
+    "PLACEHOLDER_SUBNET_PREFIX"    "${INTERNAL_SUBNET%.*}" \
     "PLACEHOLDER_AUTH_KEY"         "$REGISTRATION_TOKEN"
 
 chmod +x ./scripts/setupclient.sh

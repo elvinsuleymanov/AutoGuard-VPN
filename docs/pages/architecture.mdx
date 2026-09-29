@@ -32,6 +32,9 @@ sequenceDiagram
 
   C->>C: wg genkey → private key
   C->>C: echo privkey | wg pubkey → public key
+  C->>N: TLS handshake
+  N->>C: certificate
+  C->>C: key must match the pinned sha256, else abort
   C->>N: POST /addnewpeer<br/>X-Auth-Token: token<br/>{"public_key": "..."}
   N->>A: proxy_pass 172.29.144.50:5000
   A->>A: secrets.compare_digest(token)
@@ -41,7 +44,8 @@ sequenceDiagram
   A->>FS: write sha256[:16].conf
   A->>N: {"status":"ok","ip":"10.13.26.X","config":"..."}
   N->>C: response
-  C->>C: substitute private key into config
+  C->>C: require ip inside 10.13.26.0/24
+  C->>C: build config from baked-in server key,<br/>endpoint and DNS + assigned ip
   C->>C: write wg0.conf (mode 600)
   FS-->>W: inotifywait close_write event
   W->>W: wg addconf wg0 <new-peer.conf>
@@ -201,7 +205,8 @@ scanning any public address attracts finds nothing.
 
 1. `setup.sh` generates the keypair and writes `./wireguard/keys/server_public.key`.
 2. `peer-watcher.sh` re-writes it on WireGuard startup via `wg show wg0 public-key`.
-3. auth-service mounts it read-only at `/wg-keys/server_public.key`.
-4. `helpers.py` reads it on every `/addnewpeer` request to include in the returned client config.
+3. `setup.sh` also renders it into both client scripts, which build their tunnel config from it rather than from the registration response.
+4. auth-service mounts it read-only at `/wg-keys/server_public.key`.
+5. `helpers.py` reads it on every `/addnewpeer` request to include in the returned client config, which scripts rendered before the change above still use.
 
 The `depends_on: wireguard: condition: service_healthy` constraint guarantees WireGuard (and therefore the key file) is ready before auth-service starts.

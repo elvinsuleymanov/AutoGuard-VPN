@@ -60,6 +60,9 @@ copy around, nothing to edit on the server.
 
 - **Your keys, your server.** No VPN company in the middle to trust or audit.
 - **The private key never leaves the device.** Only the public half is sent.
+- **Clients verify your server.** Each client script carries your server's
+  certificate fingerprint and WireGuard key, so an interceptor can neither
+  steal the token nor redirect the tunnel. No domain or CA certificate needed.
 - **Ad blocking for everything.** Pi-hole answers DNS for the whole tunnel, so it
   covers every app — not just browsers with an extension.
 - **No third party in the DNS chain.** Unbound resolves from the root servers

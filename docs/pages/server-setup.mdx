@@ -134,10 +134,11 @@ Reissued automatically when the certificate is missing, `--force` is passed, or
 the public address changed.
 
 <Callout type="info">
-  The registration token is a bearer credential and the client scripts still
-  skip certificate verification, so anyone able to MITM that first request can
-  capture it. A matching CN and SAN is the prerequisite for pinning the
-  certificate in the client scripts, which is the proper fix.
+  The client scripts pin this certificate: `setup.sh` computes the SHA-256 of
+  its public key and writes it into both scripts, which then refuse any other
+  key before sending the registration token. The run prints the fingerprint as
+  `sha256//<pin>`. Because the key is pinned rather than the certificate, its
+  365-day expiry does not affect registration.
 </Callout>
 
 ### Rendering the configs
